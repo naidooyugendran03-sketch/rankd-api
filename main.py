@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 from contextlib import contextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy.orm import Session, joinedload
@@ -32,14 +32,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "4320
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        FRONTEND_URL,
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://naidooyugendran03-sketch.github.io",
-        "https://naidooyugendran03-sketch.github.io/rankd-app",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -67,7 +61,10 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(db: Session = Depends(get_db), token: str = Query(None, alias="token")):
+def get_current_user(db: Session = Depends(get_db), token: str = Query(None, alias="token"), authorization: Optional[str] = Header(None)):
+    # Accept token from query param OR Authorization header
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "")
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
