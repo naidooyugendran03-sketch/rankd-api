@@ -189,7 +189,7 @@ def set_pin(req: SetPinRequest, player: PlayerProfile = Depends(get_current_play
     return {"success": True, "message": "PIN set. Use it to unlock RANKD on this device."}
 
 @app.post("/auth/pin/verify")
-def verify_pin(req: VerifyPinRequest, db: Session = Depends(get_db), token: str = Query(None, alias="token"), authorization: Optional[str] = Query(None, alias="Authorization")):
+def verify_pin(req: VerifyPinRequest, db: Session = Depends(get_db), token: str = Query(None, alias="token"), authorization: Optional[str] = Header(None)):
     """Verify PIN and return fresh token. Accepts token via query param or Authorization header."""
     # Try Authorization header first (Bearer token), then query param
     if not token and authorization and authorization.startswith("Bearer "):
