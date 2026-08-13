@@ -32,7 +32,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "4320
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"],
+    allow_origins=[
+        FRONTEND_URL,
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://naidooyugendran03-sketch.github.io",
+        "https://naidooyugendran03-sketch.github.io/rankd-app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
