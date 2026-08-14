@@ -1,4 +1,4 @@
-"""RANKD API v1.0 — Production FastAPI Backend"""
+"""RANKD API v1.1 — Production FastAPI Backend (Corrected)"""
 import os
 import uuid
 import secrets
@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 from contextlib import contextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy.orm import Session, joinedload
@@ -23,7 +23,7 @@ from models import (
 from engine import RankdEngine, AlgorithmConfig
 
 # ─── INIT ─────────────────────────────────────────────────────
-app = FastAPI(title="RANKD API", version="1.0.0")
+app = FastAPI(title="RANKD API", version="1.1.0")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
@@ -59,6 +59,34 @@ def seed_db():
 
 seed_db()
 
+# ─── HELPERS ──────────────────────────────────────────────────
+def resolve_venue_id(venue_id_str: Optional[str], db: Session) -> Optional[uuid.UUID]:
+    """Accept UUIDs or venue name slugs. Returns UUID or None."""
+    if not venue_id_str:
+        return None
+    try:
+        return uuid.UUID(venue_id_str)
+    except ValueError:
+        # Try direct match, then partial match, then normalized (hyphens→spaces)
+        venue = db.query(Venue).filter(Venue.name.ilike(venue_id_str)).first()
+        if not venue:
+            venue = db.query(Venue).filter(Venue.name.ilike(f"%{venue_id_str}%")).first()
+        if not venue:
+            normalized = venue_id_str.replace("-", " ")
+            venue = db.query(Venue).filter(Venue.name.ilike(f"%{normalized}%")).first()
+        return venue.id if venue else None
+
+def get_player_stats(player_id: uuid.UUID, db: Session):
+    """Calculate wins/losses/draws from confirmed results."""
+    match_ids = db.query(MatchPlayer.match_id).filter(MatchPlayer.player_id == player_id).subquery()
+    results = db.query(ConfirmedResult).filter(ConfirmedResult.match_id.in_(match_ids)).all()
+    wins = sum(1 for r in results if r.winner_id == player_id)
+    draws = sum(1 for r in results if r.winner_id is None)
+    losses = len(results) - wins - draws
+    total = wins + losses + draws
+    win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
+    return {"wins": wins, "losses": losses, "draws": draws, "win_rate": win_rate}
+
 # ─── AUTH UTILS ───────────────────────────────────────────────
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -66,11 +94,19 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(db: Session = Depends(get_db), token: str = Query(None, alias="token")):
-    if not token:
+def get_current_user(
+    db: Session = Depends(get_db),
+    token: str = Query(None, alias="token"),
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    # Prefer Bearer header, fall back to query token
+    auth_token = token
+    if authorization and authorization.lower().startswith("bearer "):
+        auth_token = authorization[7:].strip()
+    if not auth_token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(auth_token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -148,6 +184,13 @@ class AddLeaguePlayerRequest(BaseModel):
     division: Optional[str] = None
     team_name: Optional[str] = None
 
+class JoinLeagueRequest(BaseModel):
+    team_name: Optional[str] = None
+
+class ApproveJoinRequest(BaseModel):
+    player_id: str
+    league_id: Optional[str] = None
+
 class GuestInviteRequest(BaseModel):
     context: str = "RANKD_CHALLENGE"
     format_value: int = 5
@@ -169,7 +212,7 @@ class VerifyPinRequest(BaseModel):
 WEAK_PINS = {
     "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999",
     "1234", "4321", "1212", "6969", "1004", "2000", "2024", "2025", "2026",
-    "2580", "0852", "1379", "9753", "0007", "0070", "1000", "2000", "9999"
+    "2580", "0852", "1379", "9753", "0007", "0070", "1000", "9999"
 }
 
 @app.post("/auth/pin/set")
@@ -186,11 +229,19 @@ def set_pin(req: SetPinRequest, player: PlayerProfile = Depends(get_current_play
     return {"success": True, "message": "PIN set. Use it to unlock RANKD on this device."}
 
 @app.post("/auth/pin/verify")
-def verify_pin(req: VerifyPinRequest, db: Session = Depends(get_db), token: str = Query(None, alias="token")):
-    if not token:
+def verify_pin(
+    req: VerifyPinRequest,
+    db: Session = Depends(get_db),
+    token: str = Query(None, alias="token"),
+    authorization: Optional[str] = Header(None, alias="Authorization")
+):
+    auth_token = token
+    if authorization and authorization.lower().startswith("bearer "):
+        auth_token = authorization[7:].strip()
+    if not auth_token:
         raise HTTPException(status_code=401, detail="No token provided")
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(auth_token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -361,6 +412,7 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 @app.get("/players/me")
 def get_me(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     rating = db.query(RatingProfile).filter(RatingProfile.player_id == player.id).first()
+    stats = get_player_stats(player.id, db)
     return {
         "id": str(player.id),
         "first_name": player.first_name,
@@ -372,11 +424,13 @@ def get_me(player: PlayerProfile = Depends(get_current_player), db: Session = De
         "country": player.country,
         "street_address": player.street_address,
         "rating": rating.public_rating if rating else 800,
+        "public_rating": rating.public_rating if rating else 800,
         "status": rating.status if rating else "UNRANKD",
         "matches_played": rating.matches_played if rating else 0,
         "placement_matches": rating.matches_played if rating else 0,
         "placement_total": 10,
         "unique_opponents": rating.unique_opponents if rating else 0,
+        **stats
     }
 
 @app.get("/players/search", response_model=List[PlayerSearchResult])
@@ -406,6 +460,7 @@ def get_player(player_id: str, db: Session = Depends(get_db)):
     if not p:
         raise HTTPException(status_code=404, detail="Player not found")
     rating = db.query(RatingProfile).filter(RatingProfile.player_id == p.id).first()
+    stats = get_player_stats(p.id, db)
     return {
         "id": str(p.id), "first_name": p.first_name, "last_name": p.last_name,
         "username": p.username, "rankd_code": p.rankd_code,
@@ -413,17 +468,19 @@ def get_player(player_id: str, db: Session = Depends(get_db)):
         "rating": rating.public_rating if rating else 800,
         "status": rating.status if rating else "UNRANKD",
         "matches_played": rating.matches_played if rating else 0,
+        **stats
     }
 
 # ─── LEADERBOARD & CHALLENGE ELIGIBILITY ──────────────────────
 @app.get("/leaderboards/{scope}")
 def get_leaderboard(scope: str, city: Optional[str] = None, db: Session = Depends(get_db)):
-    q = db.query(PlayerProfile, RatingProfile).join(
+    from sqlalchemy import func
+    q = db.query(PlayerProfile, RatingProfile).outerjoin(
         RatingProfile, PlayerProfile.id == RatingProfile.player_id
-    ).filter(RatingProfile.status == "ESTABLISHED")
+    )
     if scope == "city" and city:
         q = q.filter(PlayerProfile.city.ilike(f"%{city}%"))
-    results = q.order_by(RatingProfile.public_rating.desc()).limit(100).all()
+    results = q.order_by(func.coalesce(RatingProfile.public_rating, 800).desc()).limit(100).all()
     out = []
     for idx, (profile, rating) in enumerate(results, 1):
         out.append({
@@ -431,8 +488,10 @@ def get_leaderboard(scope: str, city: Optional[str] = None, db: Session = Depend
             "player_id": str(profile.id),
             "name": f"{profile.first_name} {profile.last_name}",
             "username": profile.username,
-            "rating": rating.public_rating,
-            "city": profile.city
+            "rating": rating.public_rating if rating else 800,
+            "city": profile.city,
+            "status": rating.status if rating else "UNRANKD",
+            "matches": rating.matches_played if rating else 0
         })
     return {"scope": scope, "city": city, "players": out}
 
@@ -442,20 +501,18 @@ def check_challenge_eligibility(
     player: PlayerProfile = Depends(get_current_player),
     db: Session = Depends(get_db)
 ):
+    from sqlalchemy import func
     opponent = db.query(PlayerProfile).filter(PlayerProfile.id == uuid.UUID(opponent_id)).first()
     if not opponent:
         raise HTTPException(status_code=404, detail="Opponent not found")
     my_rating = db.query(RatingProfile).filter(RatingProfile.player_id == player.id).first()
     opp_rating = db.query(RatingProfile).filter(RatingProfile.player_id == opponent.id).first()
-    if not my_rating or not opp_rating:
-        raise HTTPException(status_code=400, detail="Rating data missing")
     city = player.city or opponent.city or ""
-    lb = db.query(PlayerProfile, RatingProfile).join(
+    lb = db.query(PlayerProfile, RatingProfile).outerjoin(
         RatingProfile, PlayerProfile.id == RatingProfile.player_id
     ).filter(
-        RatingProfile.status == "ESTABLISHED",
         PlayerProfile.city.ilike(f"%{city}%")
-    ).order_by(RatingProfile.public_rating.desc()).all()
+    ).order_by(func.coalesce(RatingProfile.public_rating, 800).desc()).all()
     my_rank = None
     opp_rank = None
     for idx, (p, r) in enumerate(lb, 1):
@@ -467,55 +524,62 @@ def check_challenge_eligibility(
     reason = None
     rank_diff = None
     if my_rank and opp_rank:
-        rank_diff = opp_rank - my_rank
-        if rank_diff > 5:
-            eligible = False
-            reason = f"You can only challenge up to 5 spots above you. They are #{opp_rank}, you are #{my_rank}."
+        rank_diff = my_rank - opp_rank
+        if opp_rank < my_rank:
+            spots_above = my_rank - opp_rank
+            if spots_above > 5:
+                eligible = False
+                reason = f"You can only challenge up to 5 spots above you. They are #{opp_rank}, you are #{my_rank}."
     return {
         "eligible": eligible,
         "reason": reason,
         "my_rank": my_rank,
         "opponent_rank": opp_rank,
         "rank_difference": rank_diff,
-        "my_rating": my_rating.public_rating,
-        "opponent_rating": opp_rating.public_rating
+        "my_rating": my_rating.public_rating if my_rating else 800,
+        "opponent_rating": opp_rating.public_rating if opp_rating else 800
     }
 
 # ─── MATCHES & CHALLENGE NEGOTIATION ──────────────────────────
 @app.post("/matches")
 def create_match(req: CreateMatchRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     discipline = db.query(Discipline).filter(Discipline.slug == "8ball").first()
-    if req.opponent_id:
+
+    # FIX 2: Only enforce 5-position rule for LADDER_CHALLENGE context
+    if req.opponent_id and req.context == "LADDER_CHALLENGE":
+        from sqlalchemy import func
         opp = db.query(PlayerProfile).filter(PlayerProfile.id == uuid.UUID(req.opponent_id)).first()
         if opp:
-            my_rating = db.query(RatingProfile).filter(RatingProfile.player_id == player.id).first()
-            opp_rating = db.query(RatingProfile).filter(RatingProfile.player_id == opp.id).first()
-            if my_rating and opp_rating and my_rating.status == "ESTABLISHED" and opp_rating.status == "ESTABLISHED":
-                city = player.city or opp.city or ""
-                lb = db.query(PlayerProfile, RatingProfile).join(
-                    RatingProfile, PlayerProfile.id == RatingProfile.player_id
-                ).filter(
-                    RatingProfile.status == "ESTABLISHED",
-                    PlayerProfile.city.ilike(f"%{city}%")
-                ).order_by(RatingProfile.public_rating.desc()).all()
-                my_rank = None
-                opp_rank = None
-                for idx, (p, r) in enumerate(lb, 1):
-                    if str(p.id) == str(player.id):
-                        my_rank = idx
-                    if str(p.id) == str(opp.id):
-                        opp_rank = idx
-                if my_rank and opp_rank and (opp_rank - my_rank) > 5:
+            city = player.city or opp.city or ""
+            lb = db.query(PlayerProfile, RatingProfile).outerjoin(
+                RatingProfile, PlayerProfile.id == RatingProfile.player_id
+            ).filter(
+                PlayerProfile.city.ilike(f"%{city}%")
+            ).order_by(func.coalesce(RatingProfile.public_rating, 800).desc()).all()
+            my_rank = None
+            opp_rank = None
+            for idx, (p, r) in enumerate(lb, 1):
+                if str(p.id) == str(player.id):
+                    my_rank = idx
+                if str(p.id) == str(opp.id):
+                    opp_rank = idx
+            if my_rank and opp_rank and opp_rank < my_rank:
+                spots_above = my_rank - opp_rank
+                if spots_above > 5:
                     raise HTTPException(
                         status_code=403,
                         detail=f"You can only challenge up to 5 spots above you. They are #{opp_rank}, you are #{my_rank}."
                     )
+
+    # FIX 3: Resolve venue slug or UUID
+    venue_id_parsed = resolve_venue_id(req.venue_id, db)
+
     match = Match(
         discipline_id=discipline.id if discipline else None,
         context=req.context,
         rating_eligible=req.rating_eligible and req.context != "FRIENDLY",
         format_value=req.format_value,
-        venue_id=uuid.UUID(req.venue_id) if req.venue_id else None,
+        venue_id=venue_id_parsed,
         scheduled_at=req.proposed_datetime,
         status="INVITE_PENDING",
         created_by=player.id,
@@ -571,7 +635,9 @@ def counter_proposal(match_id: str, req: CounterProposalRequest, player: PlayerP
         raise HTTPException(status_code=400, detail="Match not open for negotiation")
     match.scheduled_at = req.proposed_datetime
     if req.venue_id:
-        match.venue_id = uuid.UUID(req.venue_id)
+        resolved = resolve_venue_id(req.venue_id, db)
+        if resolved:
+            match.venue_id = resolved
     match.status = "COUNTER_PENDING"
     match.proposal_count = (match.proposal_count or 0) + 1
     creator = match.players[0].player_id if match.players else match.created_by
@@ -639,43 +705,56 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
     mp = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id, MatchPlayer.player_id == player.id).first()
     if not mp:
         raise HTTPException(status_code=403, detail="You are not in this match")
+
+    # FIX 5: Normalize scores so player_a_score always = slot 1, player_b_score = slot 2
+    if mp.player_slot == 2:
+        norm_a = req.player_b_score
+        norm_b = req.player_a_score
+    else:
+        norm_a = req.player_a_score
+        norm_b = req.player_b_score
+
     existing_sub = db.query(ResultSubmission).filter(
         ResultSubmission.match_id == match.id,
         ResultSubmission.player_id == player.id
     ).first()
     if existing_sub:
-        existing_sub.player_a_score = req.player_a_score
-        existing_sub.player_b_score = req.player_b_score
+        existing_sub.player_a_score = norm_a
+        existing_sub.player_b_score = norm_b
         existing_sub.revision += 1
     else:
         db.add(ResultSubmission(
             match_id=match.id, player_id=player.id,
-            player_a_score=req.player_a_score, player_b_score=req.player_b_score
+            player_a_score=norm_a, player_b_score=norm_b
         ))
+
     all_subs = db.query(ResultSubmission).filter(ResultSubmission.match_id == match.id).all()
     if len(all_subs) == 1:
         match.status = "RESULT_PARTIAL"
     elif len(all_subs) >= 2:
-        sub_a = [s for s in all_subs if s.player_id == match.players[0].player_id][0]
-        sub_b = [s for s in all_subs if s.player_id != match.players[0].player_id][0]
-        if sub_a.player_a_score == sub_b.player_a_score and sub_a.player_b_score == sub_b.player_b_score:
+        # Both submissions are now normalized to slot order
+        if all_subs[0].player_a_score == all_subs[1].player_a_score and all_subs[0].player_b_score == all_subs[1].player_b_score:
             match.status = "CONFIRMED"
             match.confirmed_at = datetime.utcnow()
+
+            # Determine winner using slot ordering
+            players_ordered = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
             winner_id = None
-            if req.player_a_score > req.player_b_score:
-                winner_id = match.players[0].player_id
-            elif req.player_b_score > req.player_a_score:
-                winner_id = match.players[1].player_id
+            if norm_a > norm_b:
+                winner_id = players_ordered[0].player_id
+            elif norm_b > norm_a:
+                winner_id = players_ordered[1].player_id
+
             db.add(ConfirmedResult(
                 match_id=match.id,
-                player_a_score=req.player_a_score,
-                player_b_score=req.player_b_score,
+                player_a_score=norm_a,
+                player_b_score=norm_b,
                 winner_id=winner_id,
                 confirmed_by_algorithm=True
             ))
             if match.rating_eligible:
-                calculate_ratings(match, req.player_a_score, req.player_b_score, db)
-            update_rivalry(match, req.player_a_score, req.player_b_score, db)
+                calculate_ratings(match, norm_a, norm_b, db)
+            update_rivalry(match, norm_a, norm_b, db)
         else:
             match.status = "RESULT_MISMATCH"
     db.commit()
@@ -688,20 +767,35 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     p1_id, p2_id = str(players[0].player_id), str(players[1].player_id)
     rp1 = db.query(RatingProfile).filter(RatingProfile.player_id == players[0].player_id).first()
     rp2 = db.query(RatingProfile).filter(RatingProfile.player_id == players[1].player_id).first()
+    if not rp1 or not rp2:
+        return
+
     s1 = engine_service.register_player(p1_id, mu=float(rp1.mu), phi=float(rp1.phi))
     s2 = engine_service.register_player(p2_id, mu=float(rp2.mu), phi=float(rp2.phi))
     s1.volatility = float(rp1.volatility)
     s2.volatility = float(rp2.volatility)
     s1.matches_played = rp1.matches_played
     s2.matches_played = rp2.matches_played
+
+    # FIX 4: Restore and persist unique_opponents
+    s1.unique_opponents = getattr(rp1, 'unique_opponents', 0) or 0
+    s2.unique_opponents = getattr(rp2, 'unique_opponents', 0) or 0
+
     result = engine_service.calculate_match(p1_id, p2_id, score_a, score_b, match_id=str(match.id))
+
     rp1.mu = s1.mu; rp1.phi = s1.phi; rp1.volatility = s1.volatility
     rp1.matches_played = s1.matches_played; rp1.status = s1.status
     rp1.public_rating = s1.public_rating_display; rp1.last_match_at = datetime.utcnow()
+    rp1.unique_opponents = getattr(s1, 'unique_opponents', rp1.unique_opponents or 0)
+
     rp2.mu = s2.mu; rp2.phi = s2.phi; rp2.volatility = s2.volatility
     rp2.matches_played = s2.matches_played; rp2.status = s2.status
     rp2.public_rating = s2.public_rating_display; rp2.last_match_at = datetime.utcnow()
-    for ev in engine_service.rating_events[-2:]:
+    rp2.unique_opponents = getattr(s2, 'unique_opponents', rp2.unique_opponents or 0)
+
+    events = getattr(engine_service, 'rating_events', [])
+    recent_events = events[-2:] if len(events) >= 2 else events
+    for ev in recent_events:
         db.add(RatingEvent(
             match_id=uuid.UUID(ev.match_id), player_id=uuid.UUID(ev.player_id),
             rating_profile_id=rp1.id if ev.player_id == p1_id else rp2.id,
@@ -716,30 +810,61 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     db.commit()
 
 def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
-    players = sorted(match.players, key=lambda x: str(x.player_id))
-    pa, pb = players[0].player_id, players[1].player_id
+    # FIX 5: Use slot ordering for score interpretation, then normalize rivalry pair
+    mps = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
+    if len(mps) != 2:
+        return
+
+    slot1_id, slot2_id = mps[0].player_id, mps[1].player_id
+
+    # Normalize rivalry pair alphabetically by UUID string for stable storage
+    ids_sorted = sorted([str(slot1_id), str(slot2_id)])
+    pa, pb = uuid.UUID(ids_sorted[0]), uuid.UUID(ids_sorted[1])
+
     rivalry = db.query(Rivalry).filter(
         Rivalry.player_a_id == pa, Rivalry.player_b_id == pb
     ).first()
     if not rivalry:
         rivalry = Rivalry(player_a_id=pa, player_b_id=pb, first_match_at=datetime.utcnow())
         db.add(rivalry)
+
     rivalry.total_matches += 1
     rivalry.last_match_at = datetime.utcnow()
-    rivalry.total_frames_a += score_a
-    rivalry.total_frames_b += score_b
-    if score_a > score_b:
-        rivalry.player_a_wins += 1
-        rivalry.current_streak_a = max(1, rivalry.current_streak_a + 1) if rivalry.current_streak_a > 0 else 1
-        rivalry.current_streak_b = 0
-        rivalry.longest_streak_a = max(rivalry.longest_streak_a, rivalry.current_streak_a)
-    elif score_b > score_a:
-        rivalry.player_b_wins += 1
-        rivalry.current_streak_b = max(1, rivalry.current_streak_b + 1) if rivalry.current_streak_b > 0 else 1
-        rivalry.current_streak_a = 0
-        rivalry.longest_streak_b = max(rivalry.longest_streak_b, rivalry.current_streak_b)
+
+    # Map slot scores to rivalry record based on which player is which in the normalized pair
+    if str(slot1_id) == ids_sorted[0]:
+        # slot1 player is player_a in rivalry
+        rivalry.total_frames_a += score_a
+        rivalry.total_frames_b += score_b
+        if score_a > score_b:
+            rivalry.player_a_wins += 1
+            rivalry.current_streak_a = (rivalry.current_streak_a + 1) if rivalry.current_streak_a > 0 else 1
+            rivalry.current_streak_b = 0
+            rivalry.longest_streak_a = max(rivalry.longest_streak_a, rivalry.current_streak_a)
+        elif score_b > score_a:
+            rivalry.player_b_wins += 1
+            rivalry.current_streak_b = (rivalry.current_streak_b + 1) if rivalry.current_streak_b > 0 else 1
+            rivalry.current_streak_a = 0
+            rivalry.longest_streak_b = max(rivalry.longest_streak_b, rivalry.current_streak_b)
+        else:
+            rivalry.draws += 1
     else:
-        rivalry.draws += 1
+        # slot1 player is player_b in rivalry, slot2 is player_a
+        rivalry.total_frames_a += score_b
+        rivalry.total_frames_b += score_a
+        if score_b > score_a:
+            rivalry.player_a_wins += 1
+            rivalry.current_streak_a = (rivalry.current_streak_a + 1) if rivalry.current_streak_a > 0 else 1
+            rivalry.current_streak_b = 0
+            rivalry.longest_streak_a = max(rivalry.longest_streak_a, rivalry.current_streak_a)
+        elif score_a > score_b:
+            rivalry.player_b_wins += 1
+            rivalry.current_streak_b = (rivalry.current_streak_b + 1) if rivalry.current_streak_b > 0 else 1
+            rivalry.current_streak_a = 0
+            rivalry.longest_streak_b = max(rivalry.longest_streak_b, rivalry.current_streak_b)
+        else:
+            rivalry.draws += 1
+
     db.commit()
 
 # ─── NOTIFICATIONS ────────────────────────────────────────────
@@ -771,12 +896,13 @@ def get_notifications(player: PlayerProfile = Depends(get_current_player), db: S
 # ─── GUEST INVITES ────────────────────────────────────────────
 @app.post("/invites/guest")
 def create_guest_invite(req: GuestInviteRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    venue_id_parsed = resolve_venue_id(req.venue_id, db)
     match = Match(
         discipline_id=db.query(Discipline).filter(Discipline.slug == "8ball").first().id,
         context=req.context,
         rating_eligible=req.context != "FRIENDLY",
         format_value=req.format_value,
-        venue_id=uuid.UUID(req.venue_id) if req.venue_id else None,
+        venue_id=venue_id_parsed,
         scheduled_at=req.proposed_datetime,
         status="INVITE_PENDING",
         created_by=player.id
@@ -817,10 +943,15 @@ def claim_guest_invite(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid or expired invite")
     match = db.query(Match).filter(Match.id == invite.match_id).first()
     inviter = db.query(PlayerProfile).filter(PlayerProfile.id == invite.created_by_player_id).first()
+    inviter_rating = db.query(RatingProfile).filter(RatingProfile.player_id == inviter.id).first() if inviter else None
     return {
         "valid": True,
         "match_id": str(match.id),
-        "inviter": {"name": inviter.first_name, "username": inviter.username, "rating": 1800},
+        "inviter": {
+            "name": inviter.first_name,
+            "username": inviter.username,
+            "rating": inviter_rating.public_rating if inviter_rating else 800
+        },
         "context": match.context,
         "format_value": match.format_value
     }
@@ -831,10 +962,15 @@ def create_league(req: CreateLeagueRequest, player: PlayerProfile = Depends(get_
     user = db.query(User).filter(User.id == player.user_id).first()
     if not user.is_venue_owner:
         user.is_venue_owner = True
+        db.commit()  # commit user flag immediately
+
+    venue_id_parsed = resolve_venue_id(req.venue_id, db)
+    sport = db.query(Sport).filter(Sport.slug == "pool").first()
+
     league = League(
         name=req.name, city=req.city, province=req.province,
-        venue_id=uuid.UUID(req.venue_id) if req.venue_id else None,
-        sport_id=uuid.UUID(req.sport_id) if req.sport_id else db.query(Sport).filter(Sport.slug == "pool").first().id,
+        venue_id=venue_id_parsed,
+        sport_id=uuid.UUID(req.sport_id) if req.sport_id else (sport.id if sport else None),
         created_by=player.id
     )
     db.add(league)
@@ -866,17 +1002,119 @@ def add_league_player(league_id: str, req: AddLeaguePlayerRequest, player: Playe
     existing = db.query(PlayerLeague).filter(
         PlayerLeague.player_id == target.id,
         PlayerLeague.league_id == league.id,
-        PlayerLeague.season == req.division
+        PlayerLeague.season == "2026"
     ).first()
     if existing:
         raise HTTPException(status_code=409, detail="Player already in league")
     db.add(PlayerLeague(
         player_id=target.id, league_id=league.id,
         team_id=team_id, division=req.division,
-        season=req.division or "2026"
+        season="2026"
     ))
     db.commit()
     return {"success": True, "player_id": str(target.id), "league_id": league_id}
+
+# FIX 1: Missing league endpoints
+@app.post("/leagues/{league_id}/join")
+def join_league(league_id: str, req: JoinLeagueRequest = None, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found")
+    existing = db.query(PlayerLeague).filter(
+        PlayerLeague.player_id == player.id,
+        PlayerLeague.league_id == league.id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Already requested or joined this league")
+    team_id = None
+    if req and req.team_name:
+        team = db.query(Team).filter(Team.league_id == league.id, Team.name == req.team_name).first()
+        if team:
+            team_id = team.id
+    db.add(PlayerLeague(
+        player_id=player.id, league_id=league.id,
+        team_id=team_id, season="2026", is_verified=False
+    ))
+    db.commit()
+    return {"success": True, "message": "Join request sent. Awaiting approval."}
+
+@app.get("/leagues/my")
+def my_leagues(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    memberships = db.query(PlayerLeague).filter(PlayerLeague.player_id == player.id).all()
+    member_of = []
+    for m in memberships:
+        league = db.query(League).filter(League.id == m.league_id).first()
+        if league:
+            team = db.query(Team).filter(Team.id == m.team_id).first() if m.team_id else None
+            member_of.append({
+                "id": str(league.id),
+                "name": league.name,
+                "is_verified": m.is_verified,
+                "team": team.name if team else None,
+                "division": m.division
+            })
+    created = db.query(League).filter(League.created_by == player.id).all()
+    admin_of = []
+    for league in created:
+        pending = db.query(PlayerLeague).filter(
+            PlayerLeague.league_id == league.id,
+            PlayerLeague.is_verified == False
+        ).all()
+        admin_of.append({
+            "id": str(league.id),
+            "name": league.name,
+            "pending_requests": len(pending)
+        })
+    return {"member_of": member_of, "admin_of": admin_of}
+
+@app.post("/leagues/approve")
+def approve_league_join(req: ApproveJoinRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    # If league_id omitted, find the pending request in leagues this player administers
+    if req.league_id:
+        membership = db.query(PlayerLeague).filter(
+            PlayerLeague.player_id == uuid.UUID(req.player_id),
+            PlayerLeague.league_id == uuid.UUID(req.league_id)
+        ).first()
+    else:
+        admin_leagues = db.query(League).filter(League.created_by == player.id).all()
+        admin_ids = [l.id for l in admin_leagues]
+        membership = db.query(PlayerLeague).filter(
+            PlayerLeague.player_id == uuid.UUID(req.player_id),
+            PlayerLeague.league_id.in_(admin_ids),
+            PlayerLeague.is_verified == False
+        ).first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="Join request not found")
+    league = db.query(League).filter(League.id == membership.league_id).first()
+    if not league or league.created_by != player.id:
+        raise HTTPException(status_code=403, detail="Only league creator can approve")
+    membership.is_verified = True
+    db.commit()
+    return {"success": True}
+
+@app.post("/leagues/reject")
+def reject_league_join(req: ApproveJoinRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    if req.league_id:
+        membership = db.query(PlayerLeague).filter(
+            PlayerLeague.player_id == uuid.UUID(req.player_id),
+            PlayerLeague.league_id == uuid.UUID(req.league_id)
+        ).first()
+    else:
+        admin_leagues = db.query(League).filter(League.created_by == player.id).all()
+        admin_ids = [l.id for l in admin_leagues]
+        membership = db.query(PlayerLeague).filter(
+            PlayerLeague.player_id == uuid.UUID(req.player_id),
+            PlayerLeague.league_id.in_(admin_ids),
+            PlayerLeague.is_verified == False
+        ).first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="Join request not found")
+    league = db.query(League).filter(League.id == membership.league_id).first()
+    if not league or league.created_by != player.id:
+        raise HTTPException(status_code=403, detail="Only league creator can reject")
+    db.delete(membership)
+    db.commit()
+    return {"success": True}
 
 @app.get("/leagues")
 def list_leagues(city: Optional[str] = None, province: Optional[str] = None, db: Session = Depends(get_db)):
