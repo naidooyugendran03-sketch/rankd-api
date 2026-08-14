@@ -30,14 +30,19 @@ SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))  # 30 days
 
-# ─── CORS FIX ─────────────────────────────────────────────────
-# Build origin list from env + common dev origins + null for file:// access
-_cors_origins = [FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"]
+# ─── CORS ─────────────────────────────────────────────────────
+# YOUR GITHUB PAGES URL IS HARDCODED HERE + env var support
+_cors_origins = [
+    FRONTEND_URL,
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://naidooyugendran03-sketch.github.io",
+    "https://naidooyugendran03-sketch.github.io/rankd-app",
+    "null"  # for file:// testing
+]
 _extra = os.getenv("EXTRA_ORIGINS", "")
 if _extra:
     _cors_origins.extend([o.strip() for o in _extra.split(",") if o.strip()])
-if "null" not in _cors_origins:
-    _cors_origins.append("null")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,7 +58,6 @@ engine_service = RankdEngine(AlgorithmConfig())
 Base.metadata.create_all(bind=engine)
 
 def seed_db():
-    """Seed initial sport/discipline. Fixed: don't double-wrap contextmanager."""
     db = next(get_db())
     try:
         if not db.query(Sport).first():
@@ -175,7 +179,6 @@ class VerifyPinRequest(BaseModel):
     pin: str = Field(..., min_length=4, max_length=4)
 
 # ─── PIN AUTH ─────────────────────────────────────────────────
-# Common weak PINs — blocked for security
 WEAK_PINS = {
     "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999",
     "1234", "4321", "1212", "6969", "1004", "2000", "2024", "2025", "2026",
@@ -184,27 +187,21 @@ WEAK_PINS = {
 
 @app.post("/auth/pin/set")
 def set_pin(req: SetPinRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """Set a 4-digit PIN after first login."""
     user = db.query(User).filter(User.id == player.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
     if req.pin in WEAK_PINS:
         raise HTTPException(status_code=400, detail="That PIN is too common. Choose something only you would guess.")
-
     user.pin_hash = pwd_context.hash(req.pin)
     user.pin_set_at = datetime.utcnow()
     user.pin_attempts = 0
     db.commit()
-
     return {"success": True, "message": "PIN set. Use it to unlock RANKD on this device."}
 
 @app.post("/auth/pin/verify")
 def verify_pin(req: VerifyPinRequest, db: Session = Depends(get_db), token: str = Query(None, alias="token")):
-    """Verify PIN and return fresh token."""
     if not token:
         raise HTTPException(status_code=401, detail="No token provided")
-
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("sub")
@@ -212,41 +209,29 @@ def verify_pin(req: VerifyPinRequest, db: Session = Depends(get_db), token: str 
             raise HTTPException(status_code=401, detail="Invalid token")
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-
     user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
-    # Check if PIN is locked
     if user.pin_locked_until and user.pin_locked_until > datetime.utcnow():
         raise HTTPException(status_code=403, detail="PIN locked. Use mobile OTP to unlock.")
-
     if not user.pin_hash:
         raise HTTPException(status_code=400, detail="No PIN set. Use mobile OTP.")
-
     if not pwd_context.verify(req.pin, user.pin_hash):
         user.pin_attempts = (user.pin_attempts or 0) + 1
-
-        # Lock after 5 failed attempts
         if user.pin_attempts >= 5:
             user.pin_locked_until = datetime.utcnow() + timedelta(minutes=30)
             db.commit()
             raise HTTPException(status_code=403, detail="Too many failed attempts. PIN locked for 30 minutes. Use mobile OTP.")
-
         db.commit()
         remaining = 5 - user.pin_attempts
         raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
-
-    # Success — reset attempts, issue fresh token
     user.pin_attempts = 0
     db.commit()
-
     fresh_token = create_access_token({"sub": str(user.id)})
     return {"token": fresh_token, "valid": True}
 
 @app.post("/auth/pin/reset")
 def reset_pin(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """Clear PIN so user can set a new one (after mobile OTP verification)."""
     user = db.query(User).filter(User.id == player.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -259,7 +244,6 @@ def reset_pin(player: PlayerProfile = Depends(get_current_player), db: Session =
 
 @app.get("/auth/pin/status")
 def pin_status(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """Check if user has a PIN set."""
     user = db.query(User).filter(User.id == player.user_id).first()
     return {
         "has_pin": user.pin_hash is not None,
@@ -275,18 +259,11 @@ def health():
 # ─── AUTH ─────────────────────────────────────────────────────
 @app.post("/auth/otp/send")
 def send_otp(mobile_number: str, channel: str = "whatsapp", db: Session = Depends(get_db)):
-    """Send OTP via WhatsApp (default) or SMS. WhatsApp is cheaper and more reliable in SA."""
     user = db.query(User).filter(User.mobile_number == mobile_number).first()
-
-    # In production, integrate with WhatsApp Business API or Twilio WhatsApp
-    # For now, mock — but structure is ready for real provider
     if channel == "whatsapp":
         message = f"🎱 Your RANKD code: 000000\n\nValid for 10 minutes. Don't share this with anyone."
-        # TODO: Integrate WhatsApp Business API here
     else:
         message = "Your RANKD code is 000000. Valid for 10 minutes."
-        # TODO: Integrate SMS provider here
-
     return {
         "sent": True,
         "message": f"OTP sent via {channel.upper()} (mock: 000000)",
@@ -297,7 +274,6 @@ def send_otp(mobile_number: str, channel: str = "whatsapp", db: Session = Depend
 
 @app.post("/auth/refresh")
 def refresh_token(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """Get a fresh token without re-entering OTP."""
     token = create_access_token({"sub": str(player.user_id)})
     return {"token": token, "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60}
 
@@ -305,17 +281,14 @@ def refresh_token(player: PlayerProfile = Depends(get_current_player), db: Sessi
 def signup(req: SignupRequest, db: Session = Depends(get_db)):
     if req.otp_code != "000000":
         raise HTTPException(status_code=400, detail="Invalid OTP")
-
     if db.query(User).filter(User.mobile_number == req.mobile_number).first():
         raise HTTPException(status_code=409, detail="Mobile number already registered")
     if db.query(PlayerProfile).filter(PlayerProfile.username == req.username).first():
         raise HTTPException(status_code=409, detail="Username taken")
-
     user = User(mobile_number=req.mobile_number, otp_verified=True)
     db.add(user)
     db.commit()
     db.refresh(user)
-
     rankd_code = req.username.upper()[:3] + secrets.token_hex(3).upper()[:4]
     profile = PlayerProfile(
         user_id=user.id,
@@ -331,7 +304,6 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
     db.add(profile)
     db.commit()
     db.refresh(profile)
-
     discipline = db.query(Discipline).filter(Discipline.slug == "8ball").first()
     if discipline:
         db.add(RatingProfile(
@@ -341,7 +313,6 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
             status="UNRANKD", public_rating=800
         ))
         db.commit()
-
     match_id = None
     if req.invite_token:
         token_hash = hashlib.sha256(req.invite_token.encode()).hexdigest()
@@ -350,7 +321,6 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
             GuestInvite.expires_at > datetime.utcnow(),
             GuestInvite.claimed_at == None
         ).first()
-
         if invite:
             match = db.query(Match).filter(Match.id == invite.match_id).first()
             if match and match.status == "INVITE_PENDING":
@@ -361,7 +331,6 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
                 invite.claimed_by_player_id = profile.id
                 db.commit()
                 match_id = str(match.id)
-
     token = create_access_token({"sub": str(user.id)})
     return {
         "token": token,
@@ -432,7 +401,6 @@ def search_players(q: str = Query(..., min_length=1), db: Session = Depends(get_
         (PlayerProfile.username.ilike(search)) |
         (PlayerProfile.rankd_code.ilike(search))
     ).limit(20).all()
-
     out = []
     for p in results:
         rating = db.query(RatingProfile).filter(RatingProfile.player_id == p.id).first()
@@ -463,16 +431,12 @@ def get_player(player_id: str, db: Session = Depends(get_db)):
 # ─── LEADERBOARD & CHALLENGE ELIGIBILITY ──────────────────────
 @app.get("/leaderboards/{scope}")
 def get_leaderboard(scope: str, city: Optional[str] = None, db: Session = Depends(get_db)):
-    """scope: 'city', 'province', 'national'"""
     q = db.query(PlayerProfile, RatingProfile).join(
         RatingProfile, PlayerProfile.id == RatingProfile.player_id
     ).filter(RatingProfile.status == "ESTABLISHED")
-
     if scope == "city" and city:
         q = q.filter(PlayerProfile.city.ilike(f"%{city}%"))
-
     results = q.order_by(RatingProfile.public_rating.desc()).limit(100).all()
-
     out = []
     for idx, (profile, rating) in enumerate(results, 1):
         out.append({
@@ -491,18 +455,13 @@ def check_challenge_eligibility(
     player: PlayerProfile = Depends(get_current_player),
     db: Session = Depends(get_db)
 ):
-    """Check if player can challenge opponent (within 5 spots above)"""
     opponent = db.query(PlayerProfile).filter(PlayerProfile.id == uuid.UUID(opponent_id)).first()
     if not opponent:
         raise HTTPException(status_code=404, detail="Opponent not found")
-
     my_rating = db.query(RatingProfile).filter(RatingProfile.player_id == player.id).first()
     opp_rating = db.query(RatingProfile).filter(RatingProfile.player_id == opponent.id).first()
-
     if not my_rating or not opp_rating:
         raise HTTPException(status_code=400, detail="Rating data missing")
-
-    # Get city leaderboard to check rank difference
     city = player.city or opponent.city or ""
     lb = db.query(PlayerProfile, RatingProfile).join(
         RatingProfile, PlayerProfile.id == RatingProfile.player_id
@@ -510,7 +469,6 @@ def check_challenge_eligibility(
         RatingProfile.status == "ESTABLISHED",
         PlayerProfile.city.ilike(f"%{city}%")
     ).order_by(RatingProfile.public_rating.desc()).all()
-
     my_rank = None
     opp_rank = None
     for idx, (p, r) in enumerate(lb, 1):
@@ -518,17 +476,14 @@ def check_challenge_eligibility(
             my_rank = idx
         if str(p.id) == str(opponent_id):
             opp_rank = idx
-
     eligible = True
     reason = None
     rank_diff = None
-
     if my_rank and opp_rank:
         rank_diff = opp_rank - my_rank
         if rank_diff > 5:
             eligible = False
             reason = f"You can only challenge up to 5 spots above you. They are #{opp_rank}, you are #{my_rank}."
-
     return {
         "eligible": eligible,
         "reason": reason,
@@ -543,16 +498,12 @@ def check_challenge_eligibility(
 @app.post("/matches")
 def create_match(req: CreateMatchRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     discipline = db.query(Discipline).filter(Discipline.slug == "8ball").first()
-
-    # Check 5-spot restriction if opponent specified
     if req.opponent_id:
         opp = db.query(PlayerProfile).filter(PlayerProfile.id == uuid.UUID(req.opponent_id)).first()
         if opp:
             my_rating = db.query(RatingProfile).filter(RatingProfile.player_id == player.id).first()
             opp_rating = db.query(RatingProfile).filter(RatingProfile.player_id == opp.id).first()
-
             if my_rating and opp_rating and my_rating.status == "ESTABLISHED" and opp_rating.status == "ESTABLISHED":
-                # Check rank difference
                 city = player.city or opp.city or ""
                 lb = db.query(PlayerProfile, RatingProfile).join(
                     RatingProfile, PlayerProfile.id == RatingProfile.player_id
@@ -560,7 +511,6 @@ def create_match(req: CreateMatchRequest, player: PlayerProfile = Depends(get_cu
                     RatingProfile.status == "ESTABLISHED",
                     PlayerProfile.city.ilike(f"%{city}%")
                 ).order_by(RatingProfile.public_rating.desc()).all()
-
                 my_rank = None
                 opp_rank = None
                 for idx, (p, r) in enumerate(lb, 1):
@@ -568,13 +518,11 @@ def create_match(req: CreateMatchRequest, player: PlayerProfile = Depends(get_cu
                         my_rank = idx
                     if str(p.id) == str(opp.id):
                         opp_rank = idx
-
                 if my_rank and opp_rank and (opp_rank - my_rank) > 5:
                     raise HTTPException(
                         status_code=403,
                         detail=f"You can only challenge up to 5 spots above you. They are #{opp_rank}, you are #{my_rank}."
                     )
-
     match = Match(
         discipline_id=discipline.id if discipline else None,
         context=req.context,
@@ -589,12 +537,9 @@ def create_match(req: CreateMatchRequest, player: PlayerProfile = Depends(get_cu
     db.add(match)
     db.commit()
     db.refresh(match)
-
     db.add(MatchPlayer(match_id=match.id, player_id=player.id, player_slot=1))
-
     if req.opponent_id:
         db.add(MatchPlayer(match_id=match.id, player_id=uuid.UUID(req.opponent_id), player_slot=2))
-
     db.commit()
     return {
         "match_id": str(match.id),
@@ -609,11 +554,9 @@ def accept_match(match_id: str, player: PlayerProfile = Depends(get_current_play
         raise HTTPException(status_code=404, detail="Match not found")
     if match.status not in ("INVITE_PENDING", "COUNTER_PENDING"):
         raise HTTPException(status_code=400, detail=f"Match cannot be accepted (status: {match.status})")
-
     existing = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id, MatchPlayer.player_id == player.id).first()
     if not existing:
         db.add(MatchPlayer(match_id=match.id, player_id=player.id, player_slot=2))
-
     match.status = "ACCEPTED"
     match.accepted_at = datetime.utcnow()
     match.waiting_on_player_id = None
@@ -627,7 +570,6 @@ def decline_match(match_id: str, player: PlayerProfile = Depends(get_current_pla
         raise HTTPException(status_code=404, detail="Match not found")
     if match.status not in ("INVITE_PENDING", "COUNTER_PENDING"):
         raise HTTPException(status_code=400, detail="Match not in negotiable state")
-
     match.status = "DECLINED"
     match.declined_by_id = player.id
     db.commit()
@@ -640,20 +582,15 @@ def counter_proposal(match_id: str, req: CounterProposalRequest, player: PlayerP
         raise HTTPException(status_code=404, detail="Match not found")
     if match.status not in ("INVITE_PENDING", "COUNTER_PENDING"):
         raise HTTPException(status_code=400, detail="Match not open for negotiation")
-
-    # Update match with counter proposal
     match.scheduled_at = req.proposed_datetime
     if req.venue_id:
         match.venue_id = uuid.UUID(req.venue_id)
     match.status = "COUNTER_PENDING"
     match.proposal_count = (match.proposal_count or 0) + 1
-
-    # Switch who is waiting
     creator = match.players[0].player_id if match.players else match.created_by
     match.waiting_on_player_id = creator if str(player.id) != str(creator) else (
         match.players[1].player_id if len(match.players) > 1 else None
     )
-
     db.commit()
     return {
         "match_id": match_id,
@@ -668,7 +605,6 @@ def get_match(match_id: str, db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
-
     players = []
     for mp in match.players:
         p = db.query(PlayerProfile).filter(PlayerProfile.id == mp.player_id).first()
@@ -681,13 +617,11 @@ def get_match(match_id: str, db: Session = Depends(get_db)):
             "rating": r.public_rating if r else 800,
             "status": r.status if r else "UNRANKD"
         })
-
     venue = None
     if match.venue_id:
         v = db.query(Venue).filter(Venue.id == match.venue_id).first()
         if v:
             venue = {"id": str(v.id), "name": v.name, "city": v.city}
-
     return {
         "match_id": str(match.id),
         "status": match.status,
@@ -715,11 +649,9 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
     if not match or match.status not in ("ACTIVE", "AWAITING_RESULT", "RESULT_PARTIAL"):
         raise HTTPException(status_code=400, detail="Match not accepting results")
-
     mp = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id, MatchPlayer.player_id == player.id).first()
     if not mp:
         raise HTTPException(status_code=403, detail="You are not in this match")
-
     existing_sub = db.query(ResultSubmission).filter(
         ResultSubmission.match_id == match.id,
         ResultSubmission.player_id == player.id
@@ -733,24 +665,20 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
             match_id=match.id, player_id=player.id,
             player_a_score=req.player_a_score, player_b_score=req.player_b_score
         ))
-
     all_subs = db.query(ResultSubmission).filter(ResultSubmission.match_id == match.id).all()
     if len(all_subs) == 1:
         match.status = "RESULT_PARTIAL"
     elif len(all_subs) >= 2:
         sub_a = [s for s in all_subs if s.player_id == match.players[0].player_id][0]
         sub_b = [s for s in all_subs if s.player_id != match.players[0].player_id][0]
-
         if sub_a.player_a_score == sub_b.player_a_score and sub_a.player_b_score == sub_b.player_b_score:
             match.status = "CONFIRMED"
             match.confirmed_at = datetime.utcnow()
-
             winner_id = None
             if req.player_a_score > req.player_b_score:
                 winner_id = match.players[0].player_id
             elif req.player_b_score > req.player_a_score:
                 winner_id = match.players[1].player_id
-
             db.add(ConfirmedResult(
                 match_id=match.id,
                 player_a_score=req.player_a_score,
@@ -758,14 +686,11 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
                 winner_id=winner_id,
                 confirmed_by_algorithm=True
             ))
-
             if match.rating_eligible:
                 calculate_ratings(match, req.player_a_score, req.player_b_score, db)
-
             update_rivalry(match, req.player_a_score, req.player_b_score, db)
         else:
             match.status = "RESULT_MISMATCH"
-
     db.commit()
     return {"match_id": match_id, "status": match.status}
 
@@ -773,30 +698,22 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(players) != 2:
         return
-
     p1_id, p2_id = str(players[0].player_id), str(players[1].player_id)
-
     rp1 = db.query(RatingProfile).filter(RatingProfile.player_id == players[0].player_id).first()
     rp2 = db.query(RatingProfile).filter(RatingProfile.player_id == players[1].player_id).first()
-
     s1 = engine_service.register_player(p1_id, mu=float(rp1.mu), phi=float(rp1.phi))
     s2 = engine_service.register_player(p2_id, mu=float(rp2.mu), phi=float(rp2.phi))
     s1.volatility = float(rp1.volatility)
     s2.volatility = float(rp2.volatility)
     s1.matches_played = rp1.matches_played
     s2.matches_played = rp2.matches_played
-    # unique_opponents and opponent_history persist in engine memory - do NOT reset
-
     result = engine_service.calculate_match(p1_id, p2_id, score_a, score_b, match_id=str(match.id))
-
     rp1.mu = s1.mu; rp1.phi = s1.phi; rp1.volatility = s1.volatility
     rp1.matches_played = s1.matches_played; rp1.status = s1.status
     rp1.public_rating = s1.public_rating_display; rp1.last_match_at = datetime.utcnow()
-
     rp2.mu = s2.mu; rp2.phi = s2.phi; rp2.volatility = s2.volatility
     rp2.matches_played = s2.matches_played; rp2.status = s2.status
     rp2.public_rating = s2.public_rating_display; rp2.last_match_at = datetime.utcnow()
-
     for ev in engine_service.rating_events[-2:]:
         db.add(RatingEvent(
             match_id=uuid.UUID(ev.match_id), player_id=uuid.UUID(ev.player_id),
@@ -814,20 +731,16 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
 def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
     players = sorted(match.players, key=lambda x: str(x.player_id))
     pa, pb = players[0].player_id, players[1].player_id
-
     rivalry = db.query(Rivalry).filter(
         Rivalry.player_a_id == pa, Rivalry.player_b_id == pb
     ).first()
-
     if not rivalry:
         rivalry = Rivalry(player_a_id=pa, player_b_id=pb, first_match_at=datetime.utcnow())
         db.add(rivalry)
-
     rivalry.total_matches += 1
     rivalry.last_match_at = datetime.utcnow()
     rivalry.total_frames_a += score_a
     rivalry.total_frames_b += score_b
-
     if score_a > score_b:
         rivalry.player_a_wins += 1
         rivalry.current_streak_a = max(1, rivalry.current_streak_a + 1) if rivalry.current_streak_a > 0 else 1
@@ -840,19 +753,15 @@ def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
         rivalry.longest_streak_b = max(rivalry.longest_streak_b, rivalry.current_streak_b)
     else:
         rivalry.draws += 1
-
     db.commit()
 
 # ─── NOTIFICATIONS ────────────────────────────────────────────
 @app.get("/notifications")
 def get_notifications(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """Get pending challenges and match updates for current player"""
-    # Pending challenges where player is the target
     pending = db.query(Match).filter(
         Match.waiting_on_player_id == player.id,
         Match.status.in_(["INVITE_PENDING", "COUNTER_PENDING"])
     ).order_by(Match.created_at.desc()).all()
-
     out = []
     for m in pending:
         creator = db.query(PlayerProfile).filter(PlayerProfile.id == m.created_by).first()
@@ -870,7 +779,6 @@ def get_notifications(player: PlayerProfile = Depends(get_current_player), db: S
             "status": m.status,
             "proposal_count": m.proposal_count or 0
         })
-
     return {"notifications": out, "pending_count": len(out)}
 
 # ─── GUEST INVITES ────────────────────────────────────────────
@@ -889,12 +797,9 @@ def create_guest_invite(req: GuestInviteRequest, player: PlayerProfile = Depends
     db.add(match)
     db.commit()
     db.refresh(match)
-
     db.add(MatchPlayer(match_id=match.id, player_id=player.id, player_slot=1))
-
     token = secrets.token_urlsafe(16)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
-
     invite = GuestInvite(
         match_id=match.id,
         created_by_player_id=player.id,
@@ -904,7 +809,6 @@ def create_guest_invite(req: GuestInviteRequest, player: PlayerProfile = Depends
     )
     db.add(invite)
     db.commit()
-
     deep_link = f"{FRONTEND_URL}?screen=guestLanding&match={match.id}&token={token}&inviter={player.username}"
     return {
         "invite_id": str(invite.id),
@@ -924,10 +828,8 @@ def claim_guest_invite(token: str, db: Session = Depends(get_db)):
     invite = db.query(GuestInvite).filter(GuestInvite.token_hash == token_hash).first()
     if not invite or invite.expires_at < datetime.utcnow():
         raise HTTPException(status_code=400, detail="Invalid or expired invite")
-
     match = db.query(Match).filter(Match.id == invite.match_id).first()
     inviter = db.query(PlayerProfile).filter(PlayerProfile.id == invite.created_by_player_id).first()
-
     return {
         "valid": True,
         "match_id": str(match.id),
@@ -942,7 +844,6 @@ def create_league(req: CreateLeagueRequest, player: PlayerProfile = Depends(get_
     user = db.query(User).filter(User.id == player.user_id).first()
     if not user.is_venue_owner:
         user.is_venue_owner = True
-
     league = League(
         name=req.name, city=req.city, province=req.province,
         venue_id=uuid.UUID(req.venue_id) if req.venue_id else None,
@@ -952,10 +853,8 @@ def create_league(req: CreateLeagueRequest, player: PlayerProfile = Depends(get_
     db.add(league)
     db.commit()
     db.refresh(league)
-
     db.add(PlayerLeague(player_id=player.id, league_id=league.id, season=req.season, is_verified=True))
     db.commit()
-
     return {"league_id": str(league.id), "name": league.name, "invite_url": f"{FRONTEND_URL}?screen=leagueJoin&league={league.id}"}
 
 @app.post("/leagues/{league_id}/players")
@@ -965,11 +864,9 @@ def add_league_player(league_id: str, req: AddLeaguePlayerRequest, player: Playe
         raise HTTPException(status_code=404, detail="League not found")
     if league.created_by != player.id:
         raise HTTPException(status_code=403, detail="Only league creator can add players")
-
     target = db.query(PlayerProfile).filter(PlayerProfile.username == req.player_username).first()
     if not target:
         raise HTTPException(status_code=404, detail="Player not found")
-
     team_id = None
     if req.team_name:
         team = db.query(Team).filter(Team.league_id == league.id, Team.name == req.team_name).first()
@@ -979,7 +876,6 @@ def add_league_player(league_id: str, req: AddLeaguePlayerRequest, player: Playe
             db.commit()
             db.refresh(team)
         team_id = team.id
-
     existing = db.query(PlayerLeague).filter(
         PlayerLeague.player_id == target.id,
         PlayerLeague.league_id == league.id,
@@ -987,7 +883,6 @@ def add_league_player(league_id: str, req: AddLeaguePlayerRequest, player: Playe
     ).first()
     if existing:
         raise HTTPException(status_code=409, detail="Player already in league")
-
     db.add(PlayerLeague(
         player_id=target.id, league_id=league.id,
         team_id=team_id, division=req.division,
@@ -1011,10 +906,8 @@ def get_league(league_id: str, db: Session = Depends(get_db)):
     league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
     if not league:
         raise HTTPException(status_code=404, detail="League not found")
-
     players = db.query(PlayerLeague).filter(PlayerLeague.league_id == league.id).all()
     teams = db.query(Team).filter(Team.league_id == league.id).all()
-
     return {
         "id": str(league.id),
         "name": league.name,
@@ -1032,12 +925,9 @@ def generate_whatsapp_share(req: WhatsAppShareRequest, db: Session = Depends(get
     player = db.query(PlayerProfile).filter(PlayerProfile.id == uuid.UUID(req.player_id)).first()
     if not player:
         raise HTTPException(status_code=404, detail="Player not found")
-
     rating = db.query(RatingProfile).filter(RatingProfile.player_id == player.id).first()
     rankd = rating.public_rating if rating else 800
-
     profile_link = f"{FRONTEND_URL}?screen=playerProfile&player={player.username}"
-
     if req.message_override:
         text = req.message_override
     elif req.share_type == "challenge":
@@ -1046,10 +936,8 @@ def generate_whatsapp_share(req: WhatsAppShareRequest, db: Session = Depends(get
         text = f"🔥 {player.first_name} just ranked up on RANKD!\n\nCurrent rating: {rankd}\n\nCan you beat me? {profile_link}"
     else:
         text = f"🎱 {player.first_name} on RANKD — Rated {rankd}.\n\nChallenge me for rank. What's your RANKD?\n\n{profile_link}"
-
     from urllib.parse import quote
     wa_url = f"https://wa.me/?text={quote(text)}"
-
     return {"whatsapp_url": wa_url, "text": text, "profile_link": profile_link}
 
 # ─── VENUES ───────────────────────────────────────────────────
@@ -1075,7 +963,6 @@ def get_my_rivalries(db: Session = Depends(get_db), player: PlayerProfile = Depe
     rivalries = db.query(Rivalry).filter(
         (Rivalry.player_a_id == player.id) | (Rivalry.player_b_id == player.id)
     ).order_by(Rivalry.last_match_at.desc()).all()
-
     out = []
     for r in rivalries:
         is_a = r.player_a_id == player.id
