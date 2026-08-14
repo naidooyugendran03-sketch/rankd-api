@@ -1131,8 +1131,6 @@ def get_pending_requests(league_id: str, player: PlayerProfile = Depends(get_cur
             "requested_at": p.created_at.isoformat() if p.created_at else None
         } for p in pending]
     }
- for p in players[:50]]
-    }
 
 # ─── WHATSAPP SHARE ───────────────────────────────────────────
 @app.post("/share/whatsapp")
