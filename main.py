@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 from contextlib import contextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy.orm import Session, joinedload
@@ -32,8 +32,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "4320
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -61,10 +61,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(db: Session = Depends(get_db), token: str = Query(None, alias="token"), authorization: Optional[str] = Header(None)):
-    # Accept token from query param OR Authorization header
-    if not token and authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "")
+def get_current_user(db: Session = Depends(get_db), token: str = Query(None, alias="token")):
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -189,11 +186,8 @@ def set_pin(req: SetPinRequest, player: PlayerProfile = Depends(get_current_play
     return {"success": True, "message": "PIN set. Use it to unlock RANKD on this device."}
 
 @app.post("/auth/pin/verify")
-def verify_pin(req: VerifyPinRequest, db: Session = Depends(get_db), token: str = Query(None, alias="token"), authorization: Optional[str] = Header(None)):
-    """Verify PIN and return fresh token. Accepts token via query param or Authorization header."""
-    # Try Authorization header first (Bearer token), then query param
-    if not token and authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "")
+def verify_pin(req: VerifyPinRequest, db: Session = Depends(get_db), token: str = Query(None, alias="token")):
+    """Verify PIN and return fresh token."""
     if not token:
         raise HTTPException(status_code=401, detail="No token provided")
 
@@ -777,8 +771,7 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     s2.volatility = float(rp2.volatility)
     s1.matches_played = rp1.matches_played
     s2.matches_played = rp2.matches_played
-    s1.unique_opponents = set()
-    s2.unique_opponents = set()
+    # unique_opponents and opponent_history persist in engine memory - do NOT reset
 
     result = engine_service.calculate_match(p1_id, p2_id, score_a, score_b, match_id=str(match.id))
 
@@ -1017,119 +1010,6 @@ def get_league(league_id: str, db: Session = Depends(get_db)):
         "team_count": len(teams),
         "player_count": len(players),
         "players": [{"username": p.player.username, "division": p.division} for p in players[:50]]
-    }
-
-@app.post("/leagues/{league_id}/join")
-def request_join_league(league_id: str, req: AddLeaguePlayerRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """Player requests to join a league. Creator must approve."""
-    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found")
-
-    existing = db.query(PlayerLeague).filter(
-        PlayerLeague.player_id == player.id,
-        PlayerLeague.league_id == league.id
-    ).first()
-    if existing:
-        if existing.is_verified:
-            raise HTTPException(status_code=409, detail="You are already in this league")
-        else:
-            raise HTTPException(status_code=409, detail="Your join request is already pending")
-
-    team_id = None
-    if req.team_name:
-        team = db.query(Team).filter(Team.league_id == league.id, Team.name == req.team_name).first()
-        if not team:
-            team = Team(league_id=league.id, name=req.team_name)
-            db.add(team)
-            db.commit()
-            db.refresh(team)
-        team_id = team.id
-
-    db.add(PlayerLeague(
-        player_id=player.id,
-        league_id=league.id,
-        team_id=team_id,
-        division=req.division,
-        season=req.division or "2026",
-        is_verified=False
-    ))
-    db.commit()
-    return {"success": True, "message": "Join request sent. League admin will review it."}
-
-@app.post("/leagues/{league_id}/approve")
-def approve_join_request(league_id: str, player_username: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """League creator approves a pending join request."""
-    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found")
-    if league.created_by != player.id:
-        raise HTTPException(status_code=403, detail="Only the league creator can approve requests")
-
-    target = db.query(PlayerProfile).filter(PlayerProfile.username == player_username).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Player not found")
-
-    pending = db.query(PlayerLeague).filter(
-        PlayerLeague.player_id == target.id,
-        PlayerLeague.league_id == league.id,
-        PlayerLeague.is_verified == False
-    ).first()
-    if not pending:
-        raise HTTPException(status_code=404, detail="No pending request from this player")
-
-    pending.is_verified = True
-    db.commit()
-    return {"success": True, "message": f"{target.first_name} has been added to the league."}
-
-@app.post("/leagues/{league_id}/reject")
-def reject_join_request(league_id: str, player_username: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """League creator rejects a pending join request."""
-    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found")
-    if league.created_by != player.id:
-        raise HTTPException(status_code=403, detail="Only the league creator can reject requests")
-
-    target = db.query(PlayerProfile).filter(PlayerProfile.username == player_username).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Player not found")
-
-    pending = db.query(PlayerLeague).filter(
-        PlayerLeague.player_id == target.id,
-        PlayerLeague.league_id == league.id,
-        PlayerLeague.is_verified == False
-    ).first()
-    if not pending:
-        raise HTTPException(status_code=404, detail="No pending request from this player")
-
-    db.delete(pending)
-    db.commit()
-    return {"success": True, "message": "Join request rejected."}
-
-@app.get("/leagues/{league_id}/pending")
-def get_pending_requests(league_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    """Get pending join requests for a league (creator only)."""
-    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found")
-    if league.created_by != player.id:
-        raise HTTPException(status_code=403, detail="Only the league creator can view requests")
-
-    pending = db.query(PlayerLeague).filter(
-        PlayerLeague.league_id == league.id,
-        PlayerLeague.is_verified == False
-    ).all()
-
-    return {
-        "pending_count": len(pending),
-        "requests": [{
-            "player_id": str(p.player_id),
-            "username": p.player.username,
-            "name": f"{p.player.first_name} {p.player.last_name}",
-            "team": p.team.name if p.team else None,
-            "requested_at": p.created_at.isoformat() if p.created_at else None
-        } for p in pending]
     }
 
 # ─── WHATSAPP SHARE ───────────────────────────────────────────
