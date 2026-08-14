@@ -1016,7 +1016,121 @@ def get_league(league_id: str, db: Session = Depends(get_db)):
         "is_verified": league.is_verified,
         "team_count": len(teams),
         "player_count": len(players),
-        "players": [{"username": p.player.username, "division": p.division} for p in players[:50]]
+        "players": [{"username": p.player.username, "division": p.division}
+
+@app.post("/leagues/{league_id}/join")
+def request_join_league(league_id: str, req: AddLeaguePlayerRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    """Player requests to join a league. Creator must approve."""
+    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found")
+
+    existing = db.query(PlayerLeague).filter(
+        PlayerLeague.player_id == player.id,
+        PlayerLeague.league_id == league.id
+    ).first()
+    if existing:
+        if existing.is_verified:
+            raise HTTPException(status_code=409, detail="You are already in this league")
+        else:
+            raise HTTPException(status_code=409, detail="Your join request is already pending")
+
+    team_id = None
+    if req.team_name:
+        team = db.query(Team).filter(Team.league_id == league.id, Team.name == req.team_name).first()
+        if not team:
+            team = Team(league_id=league.id, name=req.team_name)
+            db.add(team)
+            db.commit()
+            db.refresh(team)
+        team_id = team.id
+
+    db.add(PlayerLeague(
+        player_id=player.id,
+        league_id=league.id,
+        team_id=team_id,
+        division=req.division,
+        season=req.division or "2026",
+        is_verified=False
+    ))
+    db.commit()
+    return {"success": True, "message": "Join request sent. League admin will review it."}
+
+@app.post("/leagues/{league_id}/approve")
+def approve_join_request(league_id: str, player_username: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    """League creator approves a pending join request."""
+    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found")
+    if league.created_by != player.id:
+        raise HTTPException(status_code=403, detail="Only the league creator can approve requests")
+
+    target = db.query(PlayerProfile).filter(PlayerProfile.username == player_username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    pending = db.query(PlayerLeague).filter(
+        PlayerLeague.player_id == target.id,
+        PlayerLeague.league_id == league.id,
+        PlayerLeague.is_verified == False
+    ).first()
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending request from this player")
+
+    pending.is_verified = True
+    db.commit()
+    return {"success": True, "message": f"{target.first_name} has been added to the league."}
+
+@app.post("/leagues/{league_id}/reject")
+def reject_join_request(league_id: str, player_username: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    """League creator rejects a pending join request."""
+    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found")
+    if league.created_by != player.id:
+        raise HTTPException(status_code=403, detail="Only the league creator can reject requests")
+
+    target = db.query(PlayerProfile).filter(PlayerProfile.username == player_username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    pending = db.query(PlayerLeague).filter(
+        PlayerLeague.player_id == target.id,
+        PlayerLeague.league_id == league.id,
+        PlayerLeague.is_verified == False
+    ).first()
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending request from this player")
+
+    db.delete(pending)
+    db.commit()
+    return {"success": True, "message": "Join request rejected."}
+
+@app.get("/leagues/{league_id}/pending")
+def get_pending_requests(league_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    """Get pending join requests for a league (creator only)."""
+    league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found")
+    if league.created_by != player.id:
+        raise HTTPException(status_code=403, detail="Only the league creator can view requests")
+
+    pending = db.query(PlayerLeague).filter(
+        PlayerLeague.league_id == league.id,
+        PlayerLeague.is_verified == False
+    ).all()
+
+    return {
+        "pending_count": len(pending),
+        "requests": [{
+            "player_id": str(p.player_id),
+            "username": p.player.username,
+            "name": f"{p.player.first_name} {p.player.last_name}",
+            "team": p.team.name if p.team else None,
+            "requested_at": p.created_at.isoformat() if p.created_at else None
+        } for p in pending]
+    }
+ for p in players[:50]]
     }
 
 # ─── WHATSAPP SHARE ───────────────────────────────────────────
