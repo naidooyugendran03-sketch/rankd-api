@@ -30,9 +30,18 @@ SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))  # 30 days
 
+# ─── CORS FIX ─────────────────────────────────────────────────
+# Build origin list from env + common dev origins + null for file:// access
+_cors_origins = [FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"]
+_extra = os.getenv("EXTRA_ORIGINS", "")
+if _extra:
+    _cors_origins.extend([o.strip() for o in _extra.split(",") if o.strip()])
+if "null" not in _cors_origins:
+    _cors_origins.append("null")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,7 +53,9 @@ engine_service = RankdEngine(AlgorithmConfig())
 Base.metadata.create_all(bind=engine)
 
 def seed_db():
-    with contextmanager(get_db)() as db:
+    """Seed initial sport/discipline. Fixed: don't double-wrap contextmanager."""
+    db = next(get_db())
+    try:
         if not db.query(Sport).first():
             sport = Sport(name="Pool", slug="pool")
             db.add(sport)
@@ -52,6 +63,9 @@ def seed_db():
             db.refresh(sport)
             db.add(Discipline(sport_id=sport.id, name="8-Ball", slug="8ball"))
             db.commit()
+    finally:
+        db.close()
+
 seed_db()
 
 # ─── AUTH UTILS ───────────────────────────────────────────────
