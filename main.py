@@ -30,24 +30,11 @@ SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))  # 30 days
 
-# ─── CORS ─────────────────────────────────────────────────────
-# YOUR GITHUB PAGES URL IS HARDCODED HERE + env var support
-_cors_origins = [
-    FRONTEND_URL,
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://naidooyugendran03-sketch.github.io",
-    "https://naidooyugendran03-sketch.github.io/rankd-app",
-    "null"  # for file:// testing
-]
-_extra = os.getenv("EXTRA_ORIGINS", "")
-if _extra:
-    _cors_origins.extend([o.strip() for o in _extra.split(",") if o.strip()])
-
+# ─── CORS FIX ─────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
