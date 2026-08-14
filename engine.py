@@ -128,6 +128,12 @@ class RankdEngine:
                 phi=phi or self.config.initial_phi,
                 volatility=0.06
             )
+        else:
+            # Always update from database to ensure we use latest ratings
+            if mu is not None:
+                self.players[player_id].mu = mu
+            if phi is not None:
+                self.players[player_id].phi = phi
         return self.players[player_id]
 
     def calculate_match(self, player_a_id: str, player_b_id: str,
