@@ -1016,7 +1016,8 @@ def get_league(league_id: str, db: Session = Depends(get_db)):
         "is_verified": league.is_verified,
         "team_count": len(teams),
         "player_count": len(players),
-        "players": [{"username": p.player.username, "division": p.division}
+        "players": [{"username": p.player.username, "division": p.division} for p in players[:50]]
+    }
 
 @app.post("/leagues/{league_id}/join")
 def request_join_league(league_id: str, req: AddLeaguePlayerRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
