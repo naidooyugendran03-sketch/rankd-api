@@ -1073,16 +1073,33 @@ def forfeit_match(
     db.add(confirmed)
     db.commit()
 
-    if match.rating_eligible:
+    rating_result = None
+
+    if (
+        match.rating_eligible
+        and match.context != "FRIENDLY"
+    ):
         try:
-            calculate_ratings(
+            rating_result = calculate_ratings(
                 match,
                 score_p1,
                 score_p2,
                 db
             )
         except Exception as e:
-            print(f"CRITICAL RATING FAILURE (forfeit) match={match.id} error={repr(e)}")
+            db.rollback()
+            print(
+                f"CRITICAL RATING FAILURE (forfeit) "
+                f"match={match.id} "
+                f"error={repr(e)}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Forfeit saved but rating "
+                    f"calculation failed: {str(e)}"
+                )
+            )
 
     try:
         update_rivalry(
@@ -1127,7 +1144,8 @@ def forfeit_match(
         "score": {
             "player_1": score_p1,
             "player_2": score_p2
-        }
+        },
+        "rating": rating_result
     }
 
 # ─── RESULT PROPOSAL / ACCEPT / DENY ───────────────────────────
@@ -1211,11 +1229,31 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
             mp.is_winner = (mp.player_id == winner_id)
         db.commit()
         
-        if match.rating_eligible:
+        rating_result = None
+
+        if (
+            match.rating_eligible
+            and match.context != "FRIENDLY"
+        ):
             try:
-                calculate_ratings(match, score_p1, score_p2, db)
+                rating_result = calculate_ratings(
+                    match, score_p1, score_p2, db
+                )
             except Exception as e:
-                print(f"CRITICAL RATING FAILURE match={match.id} error={repr(e)}")
+                db.rollback()
+                print(
+                    f"CRITICAL RATING FAILURE "
+                    f"match={match.id} "
+                    f"error={repr(e)}"
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Match result saved but rating "
+                        f"calculation failed: {str(e)}"
+                    )
+                )
+
         try:
             update_rivalry(match, score_p1, score_p2, db)
         except Exception as e:
@@ -1223,7 +1261,11 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
     else:
         db.commit()
     
-    return {"status": "CONFIRMED", "match_id": match_id}
+    return {
+        "status": "CONFIRMED",
+        "match_id": match_id,
+        "rating": rating_result
+    }
 
 @app.post("/matches/{match_id}/result/deny")
 def deny_result(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
@@ -1243,48 +1285,146 @@ def deny_result(match_id: str, player: PlayerProfile = Depends(get_current_playe
     return {"status": "ACTIVE", "message": "Result denied. Match remains in progress."}
 
 @app.get("/matches/my/active")
-def get_my_active_matches(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    mps = db.query(MatchPlayer).filter(MatchPlayer.player_id == player.id).all()
+def get_my_active_matches(
+    player: PlayerProfile = Depends(get_current_player),
+    db: Session = Depends(get_db)
+):
+    mps = (
+        db.query(MatchPlayer)
+        .filter(MatchPlayer.player_id == player.id)
+        .all()
+    )
+
     match_ids = [mp.match_id for mp in mps]
-    matches = db.query(Match).filter(
-        Match.id.in_(match_ids),
-        Match.status.in_(["ACTIVE", "PAUSED", "RESULT_PENDING"])
-    ).order_by(Match.updated_at.desc()).all()
-    
+
+    if not match_ids:
+        return {"matches": []}
+
+    matches = (
+        db.query(Match)
+        .filter(
+            Match.id.in_(match_ids),
+            Match.status.in_([
+                "ACTIVE",
+                "PAUSED",
+                "RESULT_PENDING"
+            ])
+        )
+        .order_by(Match.updated_at.desc())
+        .all()
+    )
+
     out = []
+
     for match in matches:
-        all_mps = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).all()
-        opponent_mp = next((mp for mp in all_mps if mp.player_id != player.id), None)
+
+        # ------------------------------------
+        # SAFETY CHECK:
+        # A confirmed match can NEVER be active.
+        # ------------------------------------
+        confirmed = (
+            db.query(ConfirmedResult)
+            .filter(ConfirmedResult.match_id == match.id)
+            .first()
+        )
+
+        if confirmed:
+            # Repair stale match state
+            if match.status != "CONFIRMED":
+                match.status = "CONFIRMED"
+
+                if not match.confirmed_at:
+                    match.confirmed_at = (
+                        confirmed.confirmed_at
+                        or datetime.utcnow()
+                    )
+
+                db.commit()
+
+            # Do not send this match to Home
+            continue
+
+        all_mps = (
+            db.query(MatchPlayer)
+            .filter(MatchPlayer.match_id == match.id)
+            .all()
+        )
+
+        opponent_mp = next(
+            (
+                mp for mp in all_mps
+                if mp.player_id != player.id
+            ),
+            None
+        )
+
         opponent = None
+
         if opponent_mp:
-            opp_profile = db.query(PlayerProfile).filter(PlayerProfile.id == opponent_mp.player_id).first()
+            opp_profile = (
+                db.query(PlayerProfile)
+                .filter(
+                    PlayerProfile.id ==
+                    opponent_mp.player_id
+                )
+                .first()
+            )
+
             if opp_profile:
                 opponent = {
                     "id": str(opp_profile.id),
-                    "name": f"{opp_profile.first_name} {opp_profile.last_name}",
+                    "name": (
+                        f"{opp_profile.first_name} "
+                        f"{opp_profile.last_name}"
+                    ),
                     "username": opp_profile.username
                 }
-        
-        racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
-        my_score = sum(1 for r in racks if r.winner_player_id == player.id)
-        opp_score = sum(1 for r in racks if opponent_mp and r.winner_player_id == opponent_mp.player_id)
-        
+
+        racks = (
+            db.query(MatchRack)
+            .filter(MatchRack.match_id == match.id)
+            .all()
+        )
+
+        my_score = sum(
+            1
+            for r in racks
+            if r.winner_player_id == player.id
+        )
+
+        opp_score = sum(
+            1
+            for r in racks
+            if opponent_mp
+            and r.winner_player_id == opponent_mp.player_id
+        )
+
         venue_name = None
+
         if match.venue_id:
-            v = db.query(Venue).filter(Venue.id == match.venue_id).first()
-            venue_name = v.name if v else None
-        
+            venue = (
+                db.query(Venue)
+                .filter(Venue.id == match.venue_id)
+                .first()
+            )
+
+            venue_name = venue.name if venue else None
+
         out.append({
             "match_id": str(match.id),
             "status": match.status,
             "opponent": opponent,
-            "score": {"me": my_score, "opponent": opp_score},
+            "score": {
+                "me": my_score,
+                "opponent": opp_score
+            },
             "format_value": match.format_value,
             "venue": venue_name
         })
+
     return {"matches": out}
 
-# ─── LEGACY RESULT SUBMISSION (kept for backward compatibility) ─
+
 @app.post("/matches/{match_id}/result")
 def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
@@ -1431,6 +1571,8 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
             score=ev.score, result=ev.result, explanation_code=ev.explanation_code
         ))
     db.commit()
+
+    return result
 
 def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
     mps = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
