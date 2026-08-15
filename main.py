@@ -59,6 +59,136 @@ def seed_db():
 
 seed_db()
 
+
+# ─── SOUTH AFRICA LOCATION DATA ───────────────────────────────
+# Canonical city values for leaderboard grouping.
+# Suburbs are display-only and do NOT affect rankings.
+
+SA_PROVINCES = [
+    "Eastern Cape", "Free State", "Gauteng", "KwaZulu-Natal",
+    "Limpopo", "Mpumalanga", "North West", "Northern Cape", "Western Cape"
+]
+
+SA_CITIES = {
+    "Eastern Cape": ["Bhisho", "East London", "Gqeberha", "Grahamstown", "Mthatha"],
+    "Free State": ["Bloemfontein", "Welkom"],
+    "Gauteng": ["Johannesburg", "Pretoria", "Soweto"],
+    "KwaZulu-Natal": [
+        "Pietermaritzburg", "Durban", "Ladysmith", "Newcastle",
+        "Port Shepstone", "Richards Bay", "Howick"
+    ],
+    "Limpopo": ["Polokwane", "Thohoyandou"],
+    "Mpumalanga": ["Mbombela", "Witbank"],
+    "North West": ["Mahikeng", "Rustenburg"],
+    "Northern Cape": ["Kimberley"],
+    "Western Cape": ["Cape Town", "George", "Stellenbosch"]
+}
+
+# Suburbs mapped to their canonical city
+# Used for auto-correction when a user types a suburb as city
+SA_SUBURB_TO_CITY = {
+    # Pietermaritzburg suburbs
+    "Northdale": "Pietermaritzburg",
+    "Raisethorpe": "Pietermaritzburg",
+    "Scottsville": "Pietermaritzburg",
+    "Hayfields": "Pietermaritzburg",
+    "Cascades": "Pietermaritzburg",
+    "Pelham": "Pietermaritzburg",
+    "Prestbury": "Pietermaritzburg",
+    "Woodlands": "Pietermaritzburg",
+    "Athlone": "Pietermaritzburg",
+    "Chase Valley": "Pietermaritzburg",
+    "Montrose": "Pietermaritzburg",
+    "Bisley": "Pietermaritzburg",
+    "Bishopstowe": "Pietermaritzburg",
+    "Allandale": "Pietermaritzburg",
+    "Rosedale": "Pietermaritzburg",
+    "Edendale": "Pietermaritzburg",
+    "Impendle": "Pietermaritzburg",
+    # Durban suburbs
+    "Umhlanga": "Durban",
+    "Ballito": "Durban",
+    "Westville": "Durban",
+    "Pinetown": "Durban",
+    "Kloof": "Durban",
+    "Hillcrest": "Durban",
+    "Amanzimtoti": "Durban",
+    "Bluff": "Durban",
+    "Chatsworth": "Durban",
+    "Phoenix": "Durban",
+    "Verulam": "Durban",
+    # Johannesburg suburbs
+    "Sandton": "Johannesburg",
+    "Randburg": "Johannesburg",
+    "Rosebank": "Johannesburg",
+    "Fourways": "Johannesburg",
+    "Midrand": "Johannesburg",
+    "Soweto": "Johannesburg",
+    "Alexandra": "Johannesburg",
+    "Lenasia": "Johannesburg",
+    # Pretoria suburbs
+    "Centurion": "Pretoria",
+    "Hatfield": "Pretoria",
+    "Menlyn": "Pretoria",
+    "Sunnyside": "Pretoria",
+    "Arcadia": "Pretoria",
+    "Brooklyn": "Pretoria",
+    # Cape Town suburbs
+    "Claremont": "Cape Town",
+    "Rondebosch": "Cape Town",
+    "Observatory": "Cape Town",
+    "Sea Point": "Cape Town",
+    "Green Point": "Cape Town",
+    "Mitchells Plain": "Cape Town",
+    "Khayelitsha": "Cape Town",
+    "Bellville": "Cape Town",
+    "Durbanville": "Cape Town",
+    "Kraaifontein": "Cape Town",
+    "Brackenfell": "Cape Town",
+    "Goodwood": "Cape Town",
+    "Parow": "Cape Town",
+    "Table View": "Cape Town",
+    "Milnerton": "Cape Town",
+}
+
+def canonicalize_city(city_raw: Optional[str], suburb_raw: Optional[str] = None) -> tuple:
+    """
+    Takes raw city/suburb input and returns (canonical_city, suburb).
+    If the user entered a suburb as city, we swap them.
+    If the city is not in our canonical list, we try suburb mapping.
+    """
+    if not city_raw:
+        return (None, None)
+
+    city_clean = city_raw.strip().title()
+    suburb_clean = (suburb_raw or "").strip().title() or None
+
+    # Check if city is already canonical
+    for province, cities in SA_CITIES.items():
+        if city_clean in cities:
+            return (city_clean, suburb_clean)
+
+    # Check if what they typed as "city" is actually a suburb
+    if city_clean in SA_SUBURB_TO_CITY:
+        canonical = SA_SUBURB_TO_CITY[city_clean]
+        # If they also provided a suburb, keep it; otherwise use their "city" as suburb
+        return (canonical, suburb_clean or city_clean)
+
+    # Not recognized — return as-is with a flag
+    return (city_clean, suburb_clean)
+
+
+@app.get("/locations/provinces")
+def list_provinces():
+    return {"provinces": SA_PROVINCES}
+
+@app.get("/locations/cities")
+def list_cities(province: str):
+    province_key = province.strip().title()
+    cities = SA_CITIES.get(province_key, [])
+    return {"province": province_key, "cities": cities}
+
+
 # ─── HELPERS ──────────────────────────────────────────────────
 def resolve_venue_id(venue_id_str: Optional[str], db: Session) -> Optional[uuid.UUID]:
     """Accept UUIDs or venue name slugs. Returns UUID or None."""
@@ -130,6 +260,7 @@ class SignupRequest(BaseModel):
     mobile_number: str = Field(..., min_length=10, max_length=20)
     username: str = Field(..., min_length=2, max_length=30)
     city: str = Field(..., min_length=1, max_length=100)
+    suburb: Optional[str] = Field(None, max_length=100)
     province: str = Field(..., min_length=1, max_length=100)
     country: str = Field(default="South Africa", max_length=100)
     street_address: Optional[str] = Field(None, max_length=255)
@@ -328,13 +459,16 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
     rankd_code = req.username.upper()[:3] + secrets.token_hex(3).upper()[:4]
+    # Canonicalize city/suburb so suburbs don't become the city value
+    canonical_city, canonical_suburb = canonicalize_city(req.city, req.suburb)
     profile = PlayerProfile(
         user_id=user.id,
         first_name=req.first_name,
         last_name=req.last_name,
         username=req.username,
         rankd_code=rankd_code,
-        city=req.city,
+        city=canonical_city,
+        suburb=canonical_suburb,
         province=req.province,
         country=req.country,
         street_address=req.street_address
@@ -420,6 +554,7 @@ def get_me(player: PlayerProfile = Depends(get_current_player), db: Session = De
         "username": player.username,
         "rankd_code": player.rankd_code,
         "city": player.city,
+        "suburb": player.suburb,
         "province": player.province,
         "country": player.country,
         "street_address": player.street_address,
@@ -479,7 +614,12 @@ def get_leaderboard(scope: str, city: Optional[str] = None, db: Session = Depend
         RatingProfile, PlayerProfile.id == RatingProfile.player_id
     )
     if scope == "city" and city:
-        q = q.filter(PlayerProfile.city.ilike(f"%{city}%"))
+        # Use exact match on canonical city name
+        canonical = city.strip().title()
+        # Also check if the search term is a suburb mapped to a city
+        if canonical in SA_SUBURB_TO_CITY:
+            canonical = SA_SUBURB_TO_CITY[canonical]
+        q = q.filter(PlayerProfile.city == canonical)
     results = q.order_by(func.coalesce(RatingProfile.public_rating, 800).desc()).limit(100).all()
     out = []
     for idx, (profile, rating) in enumerate(results, 1):
@@ -490,6 +630,7 @@ def get_leaderboard(scope: str, city: Optional[str] = None, db: Session = Depend
             "username": profile.username,
             "rating": rating.public_rating if rating else 800,
             "city": profile.city,
+            "suburb": profile.suburb,
             "status": rating.status if rating else "UNRANKD",
             "matches": rating.matches_played if rating else 0
         })
@@ -605,6 +746,12 @@ def accept_match(match_id: str, player: PlayerProfile = Depends(get_current_play
         raise HTTPException(status_code=404, detail="Match not found")
     if match.status not in ("INVITE_PENDING", "COUNTER_PENDING"):
         raise HTTPException(status_code=400, detail=f"Match cannot be accepted (status: {match.status})")
+    # Integrity: only the player being challenged can accept
+    if match.waiting_on_player_id and str(match.waiting_on_player_id) != str(player.id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the player being challenged can accept this match"
+        )
     existing = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id, MatchPlayer.player_id == player.id).first()
     if not existing:
         db.add(MatchPlayer(match_id=match.id, player_id=player.id, player_slot=2))
@@ -1202,6 +1349,46 @@ def get_my_rivalries(db: Session = Depends(get_db), player: PlayerProfile = Depe
             "current_streak": r.current_streak_a if is_a else r.current_streak_b
         })
     return {"rivalries": out, "total_opponents": len(out)}
+
+
+# ─── ADMIN: ONE-TIME DATA MIGRATION ───────────────────────────
+# Run this once after adding the suburb column, then remove.
+
+@app.post("/admin/migrate-suburbs")
+def migrate_suburbs(admin_token: str = Query(...), db: Session = Depends(get_db)):
+    """One-time migration: add suburb column + move suburb values out of city field.
+    Requires admin_secret query param for safety."""
+    if admin_token != os.getenv("ADMIN_SECRET", "rankd-admin-2026"):
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+    from sqlalchemy import text
+    # Step 1: Add suburb column if it doesn't exist
+    try:
+        db.execute(text("ALTER TABLE player_profiles ADD COLUMN IF NOT EXISTS suburb VARCHAR(100)"))
+        db.execute(text("ALTER TABLE venues ADD COLUMN IF NOT EXISTS suburb VARCHAR(100)"))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        # Column might already exist, continue
+        pass
+
+    # Step 2: Canonicalize existing data
+    updated = 0
+    profiles = db.query(PlayerProfile).all()
+    for p in profiles:
+        if not p.city:
+            continue
+        canonical, suburb = canonicalize_city(p.city, p.suburb)
+        if canonical != p.city or suburb != p.suburb:
+            p.city = canonical
+            p.suburb = suburb
+            updated += 1
+
+    db.commit()
+    return {
+        "migrated": updated,
+        "message": f"Updated {updated} profiles. Suburbs moved to suburb column, cities canonicalized."
+    }
 
 # ─── RUN ──────────────────────────────────────────────────────
 if __name__ == "__main__":
