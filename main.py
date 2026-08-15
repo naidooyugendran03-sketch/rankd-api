@@ -244,7 +244,11 @@ def build_match_response(match: Match, db: Session):
             elif r.winner_player_id == p2_id:
                 score["player_2"] += 1
 
+    player_1 = next((p for p in players if p["slot"] == 1), None)
+    player_2 = next((p for p in players if p["slot"] == 2), None)
+
     return {
+        "id": str(match.id),
         "match_id": str(match.id),
         "status": match.status,
         "context": match.context,
@@ -253,6 +257,10 @@ def build_match_response(match: Match, db: Session):
         "scheduled_at": match.scheduled_at.isoformat() if match.scheduled_at else None,
         "venue": venue,
         "players": players,
+        "player_1": player_1,
+        "player_2": player_2,
+        "player_1_id": player_1["player_id"] if player_1 else None,
+        "player_2_id": player_2["player_id"] if player_2 else None,
         "racks": rack_list,
         "score": score,
         "created_by": str(match.created_by),
@@ -957,6 +965,170 @@ def resume_match(match_id: str, player: PlayerProfile = Depends(get_current_play
     match.status = "ACTIVE"
     db.commit()
     return build_match_response(match, db)
+
+@app.post("/matches/{match_id}/forfeit")
+def forfeit_match(
+    match_id: str,
+    player: PlayerProfile = Depends(get_current_player),
+    db: Session = Depends(get_db)
+):
+    try:
+        match_uuid = uuid.UUID(match_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid match ID")
+
+    match = db.query(Match).filter(Match.id == match_uuid).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    require_match_participant(match, player, db)
+
+    if match.status not in ("ACTIVE", "PAUSED"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Match cannot be forfeited while status is {match.status}"
+        )
+
+    players = (
+        db.query(MatchPlayer)
+        .filter(MatchPlayer.match_id == match.id)
+        .order_by(MatchPlayer.player_slot)
+        .all()
+    )
+
+    if len(players) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Match must have exactly two players"
+        )
+
+    p1 = players[0]
+    p2 = players[1]
+
+    if p1.player_id == player.id:
+        forfeiter = p1
+        winner = p2
+    elif p2.player_id == player.id:
+        forfeiter = p2
+        winner = p1
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a participant in this match"
+        )
+
+    racks = (
+        db.query(MatchRack)
+        .filter(MatchRack.match_id == match.id)
+        .all()
+    )
+
+    score_p1 = sum(
+        1 for r in racks
+        if r.winner_player_id == p1.player_id
+    )
+
+    score_p2 = sum(
+        1 for r in racks
+        if r.winner_player_id == p2.player_id
+    )
+
+    target = (match.format_value // 2) + 1
+
+    if winner.player_id == p1.player_id:
+        score_p1 = target
+        score_p2 = min(score_p2, target - 1)
+    else:
+        score_p2 = target
+        score_p1 = min(score_p1, target - 1)
+
+    existing_result = (
+        db.query(ConfirmedResult)
+        .filter(ConfirmedResult.match_id == match.id)
+        .first()
+    )
+
+    if existing_result:
+        raise HTTPException(
+            status_code=409,
+            detail="Match already has a confirmed result"
+        )
+
+    p1.is_winner = (p1.player_id == winner.player_id)
+    p2.is_winner = (p2.player_id == winner.player_id)
+
+    match.status = "CONFIRMED"
+    match.result_confirmed_by = player.id
+    match.confirmed_at = datetime.utcnow()
+
+    confirmed = ConfirmedResult(
+        match_id=match.id,
+        player_a_score=score_p1,
+        player_b_score=score_p2,
+        winner_id=winner.player_id,
+        confirmed_at=datetime.utcnow(),
+        confirmed_by_algorithm=True
+    )
+
+    db.add(confirmed)
+    db.commit()
+
+    if match.rating_eligible:
+        try:
+            calculate_ratings(
+                match,
+                score_p1,
+                score_p2,
+                db
+            )
+        except Exception as e:
+            print(f"Forfeit rating calculation failed: {e}")
+
+    try:
+        update_rivalry(
+            match,
+            score_p1,
+            score_p2,
+            db
+        )
+    except Exception as e:
+        print(f"Forfeit rivalry update failed: {e}")
+
+    winner_profile = (
+        db.query(PlayerProfile)
+        .filter(PlayerProfile.id == winner.player_id)
+        .first()
+    )
+
+    forfeiter_profile = (
+        db.query(PlayerProfile)
+        .filter(PlayerProfile.id == forfeiter.player_id)
+        .first()
+    )
+
+    return {
+        "success": True,
+        "status": "CONFIRMED",
+        "match_id": str(match.id),
+        "forfeited_by": {
+            "player_id": str(forfeiter.player_id),
+            "name": (
+                f"{forfeiter_profile.first_name} {forfeiter_profile.last_name}"
+                if forfeiter_profile else None
+            )
+        },
+        "winner": {
+            "player_id": str(winner.player_id),
+            "name": (
+                f"{winner_profile.first_name} {winner_profile.last_name}"
+                if winner_profile else None
+            )
+        },
+        "score": {
+            "player_1": score_p1,
+            "player_2": score_p2
+        }
+    }
 
 # ─── RESULT PROPOSAL / ACCEPT / DENY ───────────────────────────
 @app.post("/matches/{match_id}/result/propose")
