@@ -1189,7 +1189,7 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
     require_match_participant(match, player, db)
     if match.result_proposed_by == player.id:
         raise HTTPException(status_code=400, detail="You cannot accept your own result")
-    
+
     racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
     players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(players) != 2:
@@ -1198,75 +1198,78 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
     p2_id = players[1].player_id
     score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
     score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
-    target = match.format_value
-    if score_p1 < target and score_p2 < target:
-        raise HTTPException(status_code=400, detail="Result is no longer valid")
-    
-    if match.status == "CONFIRMED":
-        raise HTTPException(status_code=400, detail="Match already confirmed")
-    
-    match.status = "CONFIRMED"
-    match.result_confirmed_by = player.id
-    match.confirmed_at = datetime.utcnow()
-    
-    winner_id = None
-    if score_p1 > score_p2:
-        winner_id = p1_id
-    elif score_p2 > score_p1:
-        winner_id = p2_id
-    
-    existing_confirmed = db.query(ConfirmedResult).filter(ConfirmedResult.match_id == match.id).first()
+
+    winner_id = match.proposed_winner_id
+    if not winner_id:
+        if score_p1 > score_p2:
+            winner_id = p1_id
+        elif score_p2 > score_p1:
+            winner_id = p2_id
+        else:
+            winner_id = None
+
+    rating_result = None
+
+    existing_confirmed = (
+        db.query(ConfirmedResult)
+        .filter(ConfirmedResult.match_id == match.id)
+        .first()
+    )
+
     if not existing_confirmed:
-        db.add(ConfirmedResult(
+        confirmed = ConfirmedResult(
             match_id=match.id,
             player_a_score=score_p1,
             player_b_score=score_p2,
             winner_id=winner_id,
-            confirmed_at=datetime.utcnow(),
-            confirmed_by_algorithm=False
-        ))
-        for mp in players:
-            mp.is_winner = (mp.player_id == winner_id)
-        db.commit()
-        
-        rating_result = None
+            confirmed_by=player.id,
+            confirmed_at=datetime.utcnow()
+        )
+        db.add(confirmed)
 
-        if (
-            match.rating_eligible
-            and match.context != "FRIENDLY"
-        ):
-            try:
-                rating_result = calculate_ratings(
-                    match, score_p1, score_p2, db
-                )
-            except Exception as e:
-                db.rollback()
-                print(
-                    f"CRITICAL RATING FAILURE "
-                    f"match={match.id} "
-                    f"error={repr(e)}"
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"Match result saved but rating "
-                        f"calculation failed: {str(e)}"
-                    )
-                )
+    match.status = "CONFIRMED"
+    match.confirmed_at = datetime.utcnow()
+    match.confirmed_by = player.id
+    match.winner_id = winner_id
 
+    for mp in players:
+        mp.is_winner = (mp.player_id == winner_id)
+
+    db.commit()
+
+    if (
+        match.rating_eligible
+        and match.context != "FRIENDLY"
+    ):
         try:
-            update_rivalry(match, score_p1, score_p2, db)
+            rating_result = calculate_ratings(
+                match, score_p1, score_p2, db
+            )
         except Exception as e:
-            print(f"CRITICAL RIVALRY FAILURE match={match.id} error={repr(e)}")
-    else:
-        db.commit()
-    
+            db.rollback()
+            print(
+                f"CRITICAL RATING FAILURE "
+                f"match={match.id} "
+                f"error={repr(e)}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Match result saved but rating "
+                    f"calculation failed: {str(e)}"
+                )
+            )
+
+    try:
+        update_rivalry(match, score_p1, score_p2, db)
+    except Exception as e:
+        print(f"CRITICAL RIVALRY FAILURE match={match.id} error={repr(e)}")
+
     return {
         "status": "CONFIRMED",
         "match_id": match_id,
         "rating": rating_result
     }
-
 @app.post("/matches/{match_id}/result/deny")
 def deny_result(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
@@ -1516,24 +1519,36 @@ def get_unique_opponent_ids(player_id: uuid.UUID, db: Session) -> set:
 def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     # HARD SAFETY RULE: Friendly matches NEVER affect RANKD rating.
     if match.context == "FRIENDLY":
-        return
+        return None
     if not match.rating_eligible:
-        return
+        return None
+
     players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(players) != 2:
-        return
+        raise RuntimeError(
+            f"Rating failed: expected 2 players, got {len(players)}"
+        )
+
     p1_id, p2_id = str(players[0].player_id), str(players[1].player_id)
     rp1 = db.query(RatingProfile).filter(RatingProfile.player_id == players[0].player_id).first()
     rp2 = db.query(RatingProfile).filter(RatingProfile.player_id == players[1].player_id).first()
     if not rp1 or not rp2:
-        return
+        raise RuntimeError(
+            f"Rating failed: missing RatingProfile "
+            f"rp1={bool(rp1)} rp2={bool(rp2)}"
+        )
+
+    print(
+        f"RATING START "
+        f"match={match.id} "
+        f"p1_old={rp1.public_rating} "
+        f"p2_old={rp2.public_rating}"
+    )
 
     s1 = engine_service.register_player(p1_id, mu=float(rp1.mu), phi=float(rp1.phi))
     s2 = engine_service.register_player(p2_id, mu=float(rp2.mu), phi=float(rp2.phi))
     s1.volatility = float(rp1.volatility)
     s2.volatility = float(rp2.volatility)
-    s1.matches_played = rp1.matches_played
-    s2.matches_played = rp2.matches_played
 
     s1.unique_opponents = get_unique_opponent_ids(
         players[0].player_id,
@@ -1544,36 +1559,112 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
         db
     )
 
-    result = engine_service.calculate_match(p1_id, p2_id, score_a, score_b, match_id=str(match.id))
+    s1.matches_played = rp1.matches_played or 0
+    s2.matches_played = rp2.matches_played or 0
+    s1.status = rp1.status or "UNRANKD"
+    s2.status = rp2.status or "UNRANKD"
 
-    rp1.mu = s1.mu; rp1.phi = s1.phi; rp1.volatility = s1.volatility
-    rp1.matches_played = s1.matches_played; rp1.status = s1.status
-    rp1.public_rating = s1.public_rating_display; rp1.last_match_at = datetime.utcnow()
+    result = engine_service.calculate_match(
+        player_a_id=p1_id,
+        player_b_id=p2_id,
+        score_a=score_a,
+        score_b=score_b,
+        match_id=str(match.id)
+    )
+
+    rp1.mu = s1.mu
+    rp1.phi = s1.phi
+    rp1.volatility = s1.volatility
+    rp1.matches_played = s1.matches_played
+    rp1.status = s1.status
+    rp1.public_rating = s1.public_rating_display
+    rp1.last_match_at = datetime.utcnow()
     rp1.unique_opponents = len(s1.unique_opponents)
 
-    rp2.mu = s2.mu; rp2.phi = s2.phi; rp2.volatility = s2.volatility
-    rp2.matches_played = s2.matches_played; rp2.status = s2.status
-    rp2.public_rating = s2.public_rating_display; rp2.last_match_at = datetime.utcnow()
+    rp2.mu = s2.mu
+    rp2.phi = s2.phi
+    rp2.volatility = s2.volatility
+    rp2.matches_played = s2.matches_played
+    rp2.status = s2.status
+    rp2.public_rating = s2.public_rating_display
+    rp2.last_match_at = datetime.utcnow()
     rp2.unique_opponents = len(s2.unique_opponents)
 
-    events = getattr(engine_service, 'rating_events', [])
-    recent_events = events[-2:] if len(events) >= 2 else events
-    for ev in recent_events:
-        db.add(RatingEvent(
-            match_id=uuid.UUID(ev.match_id), player_id=uuid.UUID(ev.player_id),
-            rating_profile_id=rp1.id if ev.player_id == p1_id else rp2.id,
-            algorithm_version=ev.algorithm_version, old_rating=ev.old_rating,
-            new_rating=ev.new_rating, delta=ev.delta, old_mu=ev.old_mu,
-            new_mu=ev.new_mu, old_phi=ev.old_phi, new_phi=ev.new_phi,
-            old_volatility=ev.old_volatility, new_volatility=ev.new_volatility,
-            information_weight=ev.information_weight, integrity_weight=ev.integrity_weight,
-            familiarity_factor=ev.familiarity_factor, opponent_id=uuid.UUID(ev.opponent_id),
-            score=ev.score, result=ev.result, explanation_code=ev.explanation_code
-        ))
     db.commit()
 
-    return result
+    print(
+        f"RATING SAVED "
+        f"match={match.id} "
+        f"p1_new={rp1.public_rating} "
+        f"p2_new={rp2.public_rating}"
+    )
 
+    # Save RatingEvent rows separately so an audit failure
+    # does not roll back the actual player ratings.
+    try:
+        events = getattr(
+            engine_service,
+            'rating_events',
+            []
+        )
+
+        recent_events = (
+            events[-2:]
+            if len(events) >= 2
+            else events
+        )
+
+        for ev in recent_events:
+            db.add(
+                RatingEvent(
+                    match_id=uuid.UUID(ev.match_id),
+                    player_id=uuid.UUID(ev.player_id),
+
+                    rating_profile_id=(
+                        rp1.id
+                        if ev.player_id == p1_id
+                        else rp2.id
+                    ),
+
+                    algorithm_version=ev.algorithm_version,
+
+                    old_rating=ev.old_rating,
+                    new_rating=ev.new_rating,
+                    delta=ev.delta,
+
+                    old_mu=ev.old_mu,
+                    new_mu=ev.new_mu,
+
+                    old_phi=ev.old_phi,
+                    new_phi=ev.new_phi,
+
+                    old_volatility=ev.old_volatility,
+                    new_volatility=ev.new_volatility,
+
+                    information_weight=ev.information_weight,
+                    integrity_weight=ev.integrity_weight,
+                    familiarity_factor=ev.familiarity_factor,
+
+                    opponent_id=uuid.UUID(ev.opponent_id),
+
+                    score=ev.score,
+                    result=ev.result,
+                    explanation_code=ev.explanation_code
+                )
+            )
+
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+
+        print(
+            f"RATING EVENT SAVE FAILED "
+            f"match={match.id} "
+            f"error={repr(e)}"
+        )
+
+    return result
 def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
     mps = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(mps) != 2:
