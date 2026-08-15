@@ -1,4 +1,4 @@
-"""RANKD API v1.1 — Production FastAPI Backend (Corrected)"""
+"""RANKD API v1.2 — Live Match Flow Update"""
 import os
 import uuid
 import secrets
@@ -17,13 +17,13 @@ from passlib.context import CryptContext
 from database import engine, get_db, Base
 from models import (
     User, PlayerProfile, Sport, Discipline, Venue, League, Team, PlayerLeague,
-    Match, MatchPlayer, ResultSubmission, ConfirmedResult, RatingProfile,
+    Match, MatchPlayer, MatchRack, ResultSubmission, ConfirmedResult, RatingProfile,
     RatingEvent, Rivalry, GuestInvite, RankdNight, EventAttendance
 )
 from engine import RankdEngine, AlgorithmConfig
 
 # ─── INIT ─────────────────────────────────────────────────────
-app = FastAPI(title="RANKD API", version="1.1.0")
+app = FastAPI(title="RANKD API", version="1.2.0")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
@@ -61,9 +61,6 @@ seed_db()
 
 
 # ─── SOUTH AFRICA LOCATION DATA ───────────────────────────────
-# Canonical city values for leaderboard grouping.
-# Suburbs are display-only and do NOT affect rankings.
-
 SA_PROVINCES = [
     "Eastern Cape", "Free State", "Gauteng", "KwaZulu-Natal",
     "Limpopo", "Mpumalanga", "North West", "Northern Cape", "Western Cape"
@@ -84,10 +81,7 @@ SA_CITIES = {
     "Western Cape": ["Cape Town", "George", "Stellenbosch"]
 }
 
-# Suburbs mapped to their canonical city
-# Used for auto-correction when a user types a suburb as city
 SA_SUBURB_TO_CITY = {
-    # Pietermaritzburg suburbs
     "Northdale": "Pietermaritzburg",
     "Raisethorpe": "Pietermaritzburg",
     "Scottsville": "Pietermaritzburg",
@@ -105,7 +99,6 @@ SA_SUBURB_TO_CITY = {
     "Rosedale": "Pietermaritzburg",
     "Edendale": "Pietermaritzburg",
     "Impendle": "Pietermaritzburg",
-    # Durban suburbs
     "Umhlanga": "Durban",
     "Ballito": "Durban",
     "Westville": "Durban",
@@ -117,7 +110,6 @@ SA_SUBURB_TO_CITY = {
     "Chatsworth": "Durban",
     "Phoenix": "Durban",
     "Verulam": "Durban",
-    # Johannesburg suburbs
     "Sandton": "Johannesburg",
     "Randburg": "Johannesburg",
     "Rosebank": "Johannesburg",
@@ -126,14 +118,12 @@ SA_SUBURB_TO_CITY = {
     "Soweto": "Johannesburg",
     "Alexandra": "Johannesburg",
     "Lenasia": "Johannesburg",
-    # Pretoria suburbs
     "Centurion": "Pretoria",
     "Hatfield": "Pretoria",
     "Menlyn": "Pretoria",
     "Sunnyside": "Pretoria",
     "Arcadia": "Pretoria",
     "Brooklyn": "Pretoria",
-    # Cape Town suburbs
     "Claremont": "Cape Town",
     "Rondebosch": "Cape Town",
     "Observatory": "Cape Town",
@@ -152,29 +142,16 @@ SA_SUBURB_TO_CITY = {
 }
 
 def canonicalize_city(city_raw: Optional[str], suburb_raw: Optional[str] = None) -> tuple:
-    """
-    Takes raw city/suburb input and returns (canonical_city, suburb).
-    If the user entered a suburb as city, we swap them.
-    If the city is not in our canonical list, we try suburb mapping.
-    """
     if not city_raw:
         return (None, None)
-
     city_clean = city_raw.strip().title()
     suburb_clean = (suburb_raw or "").strip().title() or None
-
-    # Check if city is already canonical
     for province, cities in SA_CITIES.items():
         if city_clean in cities:
             return (city_clean, suburb_clean)
-
-    # Check if what they typed as "city" is actually a suburb
     if city_clean in SA_SUBURB_TO_CITY:
         canonical = SA_SUBURB_TO_CITY[city_clean]
-        # If they also provided a suburb, keep it; otherwise use their "city" as suburb
         return (canonical, suburb_clean or city_clean)
-
-    # Not recognized — return as-is with a flag
     return (city_clean, suburb_clean)
 
 
@@ -191,13 +168,11 @@ def list_cities(province: str):
 
 # ─── HELPERS ──────────────────────────────────────────────────
 def resolve_venue_id(venue_id_str: Optional[str], db: Session) -> Optional[uuid.UUID]:
-    """Accept UUIDs or venue name slugs. Returns UUID or None."""
     if not venue_id_str:
         return None
     try:
         return uuid.UUID(venue_id_str)
     except ValueError:
-        # Try direct match, then partial match, then normalized (hyphens→spaces)
         venue = db.query(Venue).filter(Venue.name.ilike(venue_id_str)).first()
         if not venue:
             venue = db.query(Venue).filter(Venue.name.ilike(f"%{venue_id_str}%")).first()
@@ -207,7 +182,6 @@ def resolve_venue_id(venue_id_str: Optional[str], db: Session) -> Optional[uuid.
         return venue.id if venue else None
 
 def get_player_stats(player_id: uuid.UUID, db: Session):
-    """Calculate wins/losses/draws from confirmed results."""
     match_ids = db.query(MatchPlayer.match_id).filter(MatchPlayer.player_id == player_id).subquery()
     results = db.query(ConfirmedResult).filter(ConfirmedResult.match_id.in_(match_ids)).all()
     wins = sum(1 for r in results if r.winner_id == player_id)
@@ -216,6 +190,79 @@ def get_player_stats(player_id: uuid.UUID, db: Session):
     total = wins + losses + draws
     win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
     return {"wins": wins, "losses": losses, "draws": draws, "win_rate": win_rate}
+
+def require_match_participant(match: Match, player: PlayerProfile, db: Session):
+    mp = db.query(MatchPlayer).filter(
+        MatchPlayer.match_id == match.id,
+        MatchPlayer.player_id == player.id
+    ).first()
+    if not mp:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a participant in this match"
+        )
+    return mp
+
+def build_match_response(match: Match, db: Session):
+    players = []
+    for mp in match.players:
+        p = db.query(PlayerProfile).filter(PlayerProfile.id == mp.player_id).first()
+        r = db.query(RatingProfile).filter(RatingProfile.player_id == mp.player_id).first()
+        players.append({
+            "player_id": str(mp.player_id),
+            "slot": mp.player_slot,
+            "name": f"{p.first_name} {p.last_name}" if p else None,
+            "username": p.username if p else None,
+            "rating": r.public_rating if r else 800,
+            "status": r.status if r else "UNRANKD"
+        })
+    venue = None
+    if match.venue_id:
+        v = db.query(Venue).filter(Venue.id == match.venue_id).first()
+        if v:
+            venue = {"id": str(v.id), "name": v.name, "city": v.city}
+
+    racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).order_by(MatchRack.rack_number).all()
+    rack_list = []
+    for r in racks:
+        winner = db.query(PlayerProfile).filter(PlayerProfile.id == r.winner_player_id).first()
+        rack_list.append({
+            "rack_number": r.rack_number,
+            "winner_player_id": str(r.winner_player_id),
+            "winner_name": f"{winner.first_name} {winner.last_name}" if winner else None
+        })
+
+    score = {"player_1": 0, "player_2": 0}
+    target_wins = (match.format_value // 2) + 1
+    players_ordered = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
+    if len(players_ordered) >= 2:
+        p1_id = players_ordered[0].player_id
+        p2_id = players_ordered[1].player_id
+        for r in racks:
+            if r.winner_player_id == p1_id:
+                score["player_1"] += 1
+            elif r.winner_player_id == p2_id:
+                score["player_2"] += 1
+
+    return {
+        "match_id": str(match.id),
+        "status": match.status,
+        "context": match.context,
+        "format_value": match.format_value,
+        "target_wins": target_wins,
+        "scheduled_at": match.scheduled_at.isoformat() if match.scheduled_at else None,
+        "venue": venue,
+        "players": players,
+        "racks": rack_list,
+        "score": score,
+        "created_by": str(match.created_by),
+        "waiting_on": str(match.waiting_on_player_id) if match.waiting_on_player_id else None,
+        "proposal_count": match.proposal_count or 0,
+        "started_at": match.started_at.isoformat() if match.started_at else None,
+        "paused_at": match.paused_at.isoformat() if match.paused_at else None,
+        "result_proposed_by": str(match.result_proposed_by) if match.result_proposed_by else None,
+        "result_proposed_at": match.result_proposed_at.isoformat() if match.result_proposed_at else None,
+    }
 
 # ─── AUTH UTILS ───────────────────────────────────────────────
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
@@ -229,7 +276,6 @@ def get_current_user(
     token: str = Query(None, alias="token"),
     authorization: Optional[str] = Header(None, alias="Authorization")
 ):
-    # Prefer Bearer header, fall back to query token
     auth_token = token
     if authorization and authorization.lower().startswith("bearer "):
         auth_token = authorization[7:].strip()
@@ -300,6 +346,12 @@ class SubmitResultRequest(BaseModel):
     match_id: str
     player_a_score: int = Field(..., ge=0, le=50)
     player_b_score: int = Field(..., ge=0, le=50)
+
+class RecordRackRequest(BaseModel):
+    winner_player_id: str
+
+class UpdateRackRequest(BaseModel):
+    winner_player_id: str
 
 class CreateLeagueRequest(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
@@ -459,7 +511,6 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
     rankd_code = req.username.upper()[:3] + secrets.token_hex(3).upper()[:4]
-    # Canonicalize city/suburb so suburbs don't become the city value
     canonical_city, canonical_suburb = canonicalize_city(req.city, req.suburb)
     profile = PlayerProfile(
         user_id=user.id,
@@ -497,8 +548,10 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
             match = db.query(Match).filter(Match.id == invite.match_id).first()
             if match and match.status == "INVITE_PENDING":
                 db.add(MatchPlayer(match_id=match.id, player_id=profile.id, player_slot=2))
-                match.status = "ACCEPTED"
+                match.status = "ACTIVE"
+                match.started_at = datetime.utcnow()
                 match.accepted_at = datetime.utcnow()
+                match.waiting_on_player_id = None
                 invite.claimed_at = datetime.utcnow()
                 invite.claimed_by_player_id = profile.id
                 db.commit()
@@ -614,9 +667,7 @@ def get_leaderboard(scope: str, city: Optional[str] = None, db: Session = Depend
         RatingProfile, PlayerProfile.id == RatingProfile.player_id
     )
     if scope == "city" and city:
-        # Use exact match on canonical city name
         canonical = city.strip().title()
-        # Also check if the search term is a suburb mapped to a city
         if canonical in SA_SUBURB_TO_CITY:
             canonical = SA_SUBURB_TO_CITY[canonical]
         q = q.filter(PlayerProfile.city == canonical)
@@ -686,7 +737,6 @@ def check_challenge_eligibility(
 def create_match(req: CreateMatchRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     discipline = db.query(Discipline).filter(Discipline.slug == "8ball").first()
 
-    # FIX 2: Only enforce 5-position rule for LADDER_CHALLENGE context
     if req.opponent_id and req.context == "LADDER_CHALLENGE":
         from sqlalchemy import func
         opp = db.query(PlayerProfile).filter(PlayerProfile.id == uuid.UUID(req.opponent_id)).first()
@@ -712,7 +762,6 @@ def create_match(req: CreateMatchRequest, player: PlayerProfile = Depends(get_cu
                         detail=f"You can only challenge up to 5 spots above you. They are #{opp_rank}, you are #{my_rank}."
                     )
 
-    # FIX 3: Resolve venue slug or UUID
     venue_id_parsed = resolve_venue_id(req.venue_id, db)
 
     match = Match(
@@ -746,7 +795,6 @@ def accept_match(match_id: str, player: PlayerProfile = Depends(get_current_play
         raise HTTPException(status_code=404, detail="Match not found")
     if match.status not in ("INVITE_PENDING", "COUNTER_PENDING"):
         raise HTTPException(status_code=400, detail=f"Match cannot be accepted (status: {match.status})")
-    # Integrity: only the player being challenged can accept
     if match.waiting_on_player_id and str(match.waiting_on_player_id) != str(player.id):
         raise HTTPException(
             status_code=403,
@@ -755,11 +803,12 @@ def accept_match(match_id: str, player: PlayerProfile = Depends(get_current_play
     existing = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id, MatchPlayer.player_id == player.id).first()
     if not existing:
         db.add(MatchPlayer(match_id=match.id, player_id=player.id, player_slot=2))
-    match.status = "ACCEPTED"
+    match.status = "ACTIVE"
+    match.started_at = datetime.utcnow()
     match.accepted_at = datetime.utcnow()
     match.waiting_on_player_id = None
     db.commit()
-    return {"match_id": match_id, "status": match.status}
+    return build_match_response(match, db)
 
 @app.post("/matches/{match_id}/decline")
 def decline_match(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
@@ -801,49 +850,269 @@ def counter_proposal(match_id: str, req: CounterProposalRequest, player: PlayerP
     }
 
 @app.get("/matches/{match_id}")
-def get_match(match_id: str, db: Session = Depends(get_db)):
+def get_match(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
-    players = []
-    for mp in match.players:
-        p = db.query(PlayerProfile).filter(PlayerProfile.id == mp.player_id).first()
-        r = db.query(RatingProfile).filter(RatingProfile.player_id == mp.player_id).first()
-        players.append({
-            "player_id": str(mp.player_id),
-            "slot": mp.player_slot,
-            "name": f"{p.first_name} {p.last_name}" if p else None,
-            "username": p.username if p else None,
-            "rating": r.public_rating if r else 800,
-            "status": r.status if r else "UNRANKD"
-        })
-    venue = None
-    if match.venue_id:
-        v = db.query(Venue).filter(Venue.id == match.venue_id).first()
-        if v:
-            venue = {"id": str(v.id), "name": v.name, "city": v.city}
-    return {
-        "match_id": str(match.id),
-        "status": match.status,
-        "context": match.context,
-        "format_value": match.format_value,
-        "scheduled_at": match.scheduled_at.isoformat() if match.scheduled_at else None,
-        "venue": venue,
-        "players": players,
-        "created_by": str(match.created_by),
-        "waiting_on": str(match.waiting_on_player_id) if match.waiting_on_player_id else None,
-        "proposal_count": match.proposal_count or 0
-    }
+    require_match_participant(match, player, db)
+    return build_match_response(match, db)
 
 @app.post("/matches/{match_id}/start")
 def start_match(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
     if not match or match.status != "ACCEPTED":
         raise HTTPException(status_code=400, detail="Match not in accepted state")
+    require_match_participant(match, player, db)
     match.status = "ACTIVE"
     db.commit()
-    return {"match_id": match_id, "status": "ACTIVE"}
+    return build_match_response(match, db)
 
+# ─── LIVE MATCH RACKS ─────────────────────────────────────────
+@app.post("/matches/{match_id}/racks")
+def record_rack(match_id: str, req: RecordRackRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    require_match_participant(match, player, db)
+    if match.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Match is not active")
+    
+    winner_id = uuid.UUID(req.winner_player_id)
+    participants = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).all()
+    participant_ids = {p.player_id for p in participants}
+    if winner_id not in participant_ids:
+        raise HTTPException(status_code=400, detail="Winner must be a match participant")
+    
+    target_wins = (match.format_value // 2) + 1
+    current_racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
+    scores = {}
+    for p in participants:
+        scores[p.player_id] = sum(1 for r in current_racks if r.winner_player_id == p.player_id)
+    if any(s >= target_wins for s in scores.values()):
+        raise HTTPException(status_code=400, detail="Match is already complete")
+    
+    next_rack = len(current_racks) + 1
+    existing = db.query(MatchRack).filter(
+        MatchRack.match_id == match.id,
+        MatchRack.rack_number == next_rack
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Rack already recorded")
+    
+    rack = MatchRack(
+        match_id=match.id,
+        rack_number=next_rack,
+        winner_player_id=winner_id,
+        recorded_by_player_id=player.id
+    )
+    db.add(rack)
+    db.commit()
+    return build_match_response(match, db)
+
+@app.patch("/matches/{match_id}/racks/{rack_number}")
+def update_rack(match_id: str, rack_number: int, req: UpdateRackRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    require_match_participant(match, player, db)
+    if match.status not in ("ACTIVE", "PAUSED", "RESULT_PENDING"):
+        raise HTTPException(status_code=400, detail="Cannot modify racks in this match state")
+    
+    rack = db.query(MatchRack).filter(
+        MatchRack.match_id == match.id,
+        MatchRack.rack_number == rack_number
+    ).first()
+    if not rack:
+        raise HTTPException(status_code=404, detail="Rack not found")
+    
+    winner_id = uuid.UUID(req.winner_player_id)
+    participants = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).all()
+    participant_ids = {p.player_id for p in participants}
+    if winner_id not in participant_ids:
+        raise HTTPException(status_code=400, detail="Winner must be a participant")
+    
+    rack.winner_player_id = winner_id
+    rack.recorded_by_player_id = player.id
+    rack.updated_at = datetime.utcnow()
+    db.commit()
+    return build_match_response(match, db)
+
+@app.post("/matches/{match_id}/pause")
+def pause_match(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match or match.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Match is not active")
+    require_match_participant(match, player, db)
+    match.status = "PAUSED"
+    match.paused_at = datetime.utcnow()
+    db.commit()
+    return build_match_response(match, db)
+
+@app.post("/matches/{match_id}/resume")
+def resume_match(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match or match.status != "PAUSED":
+        raise HTTPException(status_code=400, detail="Match is not paused")
+    require_match_participant(match, player, db)
+    match.status = "ACTIVE"
+    db.commit()
+    return build_match_response(match, db)
+
+# ─── RESULT PROPOSAL / ACCEPT / DENY ───────────────────────────
+@app.post("/matches/{match_id}/result/propose")
+def propose_result(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    require_match_participant(match, player, db)
+    if match.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Match must be active to propose result")
+    
+    racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
+    players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
+    if len(players) != 2:
+        raise HTTPException(status_code=400, detail="Invalid match player count")
+    
+    p1_id = players[0].player_id
+    p2_id = players[1].player_id
+    score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
+    score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
+    target = (match.format_value // 2) + 1
+    
+    if score_p1 < target and score_p2 < target:
+        raise HTTPException(status_code=400, detail=f"Match is not complete. Need {target} wins to finish.")
+    
+    match.status = "RESULT_PENDING"
+    match.result_proposed_by = player.id
+    match.result_proposed_at = datetime.utcnow()
+    db.commit()
+    return {
+        "status": "RESULT_PENDING",
+        "score": {"player_1": score_p1, "player_2": score_p2}
+    }
+
+@app.post("/matches/{match_id}/result/accept")
+def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match or match.status != "RESULT_PENDING":
+        raise HTTPException(status_code=400, detail="No result pending")
+    require_match_participant(match, player, db)
+    if match.result_proposed_by == player.id:
+        raise HTTPException(status_code=400, detail="You cannot accept your own result")
+    
+    racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
+    players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
+    if len(players) != 2:
+        raise HTTPException(status_code=400, detail="Invalid match")
+    p1_id = players[0].player_id
+    p2_id = players[1].player_id
+    score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
+    score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
+    target = (match.format_value // 2) + 1
+    if score_p1 < target and score_p2 < target:
+        raise HTTPException(status_code=400, detail="Result is no longer valid")
+    
+    if match.status == "CONFIRMED":
+        raise HTTPException(status_code=400, detail="Match already confirmed")
+    
+    match.status = "CONFIRMED"
+    match.result_confirmed_by = player.id
+    match.confirmed_at = datetime.utcnow()
+    
+    winner_id = None
+    if score_p1 > score_p2:
+        winner_id = p1_id
+    elif score_p2 > score_p1:
+        winner_id = p2_id
+    
+    existing_confirmed = db.query(ConfirmedResult).filter(ConfirmedResult.match_id == match.id).first()
+    if not existing_confirmed:
+        db.add(ConfirmedResult(
+            match_id=match.id,
+            player_a_score=score_p1,
+            player_b_score=score_p2,
+            winner_id=winner_id,
+            confirmed_at=datetime.utcnow(),
+            confirmed_by_algorithm=False
+        ))
+        for mp in players:
+            mp.is_winner = (mp.player_id == winner_id)
+        db.commit()
+        
+        if match.rating_eligible:
+            try:
+                calculate_ratings(match, score_p1, score_p2, db)
+            except Exception as e:
+                print(f"Rating calculation failed: {e}")
+        try:
+            update_rivalry(match, score_p1, score_p2, db)
+        except Exception as e:
+            print(f"Rivalry update failed: {e}")
+    else:
+        db.commit()
+    
+    return {"status": "CONFIRMED", "match_id": match_id}
+
+@app.post("/matches/{match_id}/result/deny")
+def deny_result(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match or match.status != "RESULT_PENDING":
+        raise HTTPException(status_code=400, detail="No result pending")
+    require_match_participant(match, player, db)
+    if match.result_proposed_by == player.id:
+        raise HTTPException(status_code=400, detail="You cannot deny your own result")
+    
+    match.result_denied_by = player.id
+    match.result_denied_at = datetime.utcnow()
+    match.result_proposed_by = None
+    match.result_proposed_at = None
+    match.status = "ACTIVE"
+    db.commit()
+    return {"status": "ACTIVE", "message": "Result denied. Match remains in progress."}
+
+@app.get("/matches/my/active")
+def get_my_active_matches(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    mps = db.query(MatchPlayer).filter(MatchPlayer.player_id == player.id).all()
+    match_ids = [mp.match_id for mp in mps]
+    matches = db.query(Match).filter(
+        Match.id.in_(match_ids),
+        Match.status.in_(["ACTIVE", "PAUSED", "RESULT_PENDING"])
+    ).order_by(Match.updated_at.desc()).all()
+    
+    out = []
+    for match in matches:
+        all_mps = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).all()
+        opponent_mp = next((mp for mp in all_mps if mp.player_id != player.id), None)
+        opponent = None
+        if opponent_mp:
+            opp_profile = db.query(PlayerProfile).filter(PlayerProfile.id == opponent_mp.player_id).first()
+            if opp_profile:
+                opponent = {
+                    "id": str(opp_profile.id),
+                    "name": f"{opp_profile.first_name} {opp_profile.last_name}",
+                    "username": opp_profile.username
+                }
+        
+        racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
+        my_score = sum(1 for r in racks if r.winner_player_id == player.id)
+        opp_score = sum(1 for r in racks if opponent_mp and r.winner_player_id == opponent_mp.player_id)
+        
+        venue_name = None
+        if match.venue_id:
+            v = db.query(Venue).filter(Venue.id == match.venue_id).first()
+            venue_name = v.name if v else None
+        
+        out.append({
+            "match_id": str(match.id),
+            "status": match.status,
+            "opponent": opponent,
+            "score": {"me": my_score, "opponent": opp_score},
+            "format_value": match.format_value,
+            "venue": venue_name
+        })
+    return {"matches": out}
+
+# ─── LEGACY RESULT SUBMISSION (kept for backward compatibility) ─
 @app.post("/matches/{match_id}/result")
 def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
@@ -853,7 +1122,6 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
     if not mp:
         raise HTTPException(status_code=403, detail="You are not in this match")
 
-    # FIX 5: Normalize scores so player_a_score always = slot 1, player_b_score = slot 2
     if mp.player_slot == 2:
         norm_a = req.player_b_score
         norm_b = req.player_a_score
@@ -879,12 +1147,10 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
     if len(all_subs) == 1:
         match.status = "RESULT_PARTIAL"
     elif len(all_subs) >= 2:
-        # Both submissions are now normalized to slot order
         if all_subs[0].player_a_score == all_subs[1].player_a_score and all_subs[0].player_b_score == all_subs[1].player_b_score:
             match.status = "CONFIRMED"
             match.confirmed_at = datetime.utcnow()
 
-            # Determine winner using slot ordering
             players_ordered = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
             winner_id = None
             if norm_a > norm_b:
@@ -924,7 +1190,6 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     s1.matches_played = rp1.matches_played
     s2.matches_played = rp2.matches_played
 
-    # FIX 4: Restore and persist unique_opponents
     s1.unique_opponents = getattr(rp1, 'unique_opponents', 0) or 0
     s2.unique_opponents = getattr(rp2, 'unique_opponents', 0) or 0
 
@@ -957,14 +1222,12 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     db.commit()
 
 def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
-    # FIX 5: Use slot ordering for score interpretation, then normalize rivalry pair
     mps = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(mps) != 2:
         return
 
     slot1_id, slot2_id = mps[0].player_id, mps[1].player_id
 
-    # Normalize rivalry pair alphabetically by UUID string for stable storage
     ids_sorted = sorted([str(slot1_id), str(slot2_id)])
     pa, pb = uuid.UUID(ids_sorted[0]), uuid.UUID(ids_sorted[1])
 
@@ -978,9 +1241,7 @@ def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
     rivalry.total_matches += 1
     rivalry.last_match_at = datetime.utcnow()
 
-    # Map slot scores to rivalry record based on which player is which in the normalized pair
     if str(slot1_id) == ids_sorted[0]:
-        # slot1 player is player_a in rivalry
         rivalry.total_frames_a += score_a
         rivalry.total_frames_b += score_b
         if score_a > score_b:
@@ -996,7 +1257,6 @@ def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
         else:
             rivalry.draws += 1
     else:
-        # slot1 player is player_b in rivalry, slot2 is player_a
         rivalry.total_frames_a += score_b
         rivalry.total_frames_b += score_a
         if score_b > score_a:
@@ -1017,28 +1277,79 @@ def update_rivalry(match: Match, score_a: int, score_b: int, db: Session):
 # ─── NOTIFICATIONS ────────────────────────────────────────────
 @app.get("/notifications")
 def get_notifications(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    pending = db.query(Match).filter(
+    incoming = db.query(Match).filter(
         Match.waiting_on_player_id == player.id,
         Match.status.in_(["INVITE_PENDING", "COUNTER_PENDING"])
     ).order_by(Match.created_at.desc()).all()
-    out = []
-    for m in pending:
+    
+    active = db.query(Match).join(MatchPlayer).filter(
+        MatchPlayer.player_id == player.id,
+        Match.status == "ACTIVE"
+    ).order_by(Match.updated_at.desc()).all()
+    
+    paused = db.query(Match).join(MatchPlayer).filter(
+        MatchPlayer.player_id == player.id,
+        Match.status == "PAUSED"
+    ).order_by(Match.updated_at.desc()).all()
+    
+    result_pending = db.query(Match).join(MatchPlayer).filter(
+        MatchPlayer.player_id == player.id,
+        Match.status == "RESULT_PENDING",
+        Match.result_proposed_by != player.id
+    ).order_by(Match.result_proposed_at.desc()).all()
+    
+    def match_to_notif(m, ntype):
         creator = db.query(PlayerProfile).filter(PlayerProfile.id == m.created_by).first()
         venue = db.query(Venue).filter(Venue.id == m.venue_id).first() if m.venue_id else None
-        out.append({
+        all_mps = db.query(MatchPlayer).filter(MatchPlayer.match_id == m.id).all()
+        opponent_mp = next((mp for mp in all_mps if mp.player_id != player.id), None)
+        opponent = None
+        if opponent_mp:
+            opp_profile = db.query(PlayerProfile).filter(PlayerProfile.id == opponent_mp.player_id).first()
+            opponent = opp_profile
+        
+        racks = db.query(MatchRack).filter(MatchRack.match_id == m.id).all()
+        my_score = sum(1 for r in racks if r.winner_player_id == player.id)
+        opp_score = 0
+        if opponent_mp:
+            opp_score = sum(1 for r in racks if r.winner_player_id == opponent_mp.player_id)
+        
+        obj = {
             "match_id": str(m.id),
-            "type": "challenge" if m.status == "INVITE_PENDING" else "counter",
+            "type": ntype,
+            "status": m.status,
             "from": {
                 "name": f"{creator.first_name} {creator.last_name}" if creator else None,
                 "username": creator.username if creator else None
-            },
-            "proposed_datetime": m.scheduled_at.isoformat() if m.scheduled_at else None,
+            } if creator else None,
+            "opponent": {
+                "name": f"{opponent.first_name} {opponent.last_name}" if opponent else None,
+                "username": opponent.username if opponent else None
+            } if opponent else None,
             "venue": venue.name if venue else None,
             "format_value": m.format_value,
-            "status": m.status,
-            "proposal_count": m.proposal_count or 0
-        })
-    return {"notifications": out, "pending_count": len(out)}
+            "score": {"me": my_score, "opponent": opp_score},
+            "proposal_count": m.proposal_count or 0,
+            "result_proposed_by": str(m.result_proposed_by) if m.result_proposed_by else None
+        }
+        if ntype in ("challenge", "counter"):
+            obj["proposed_datetime"] = m.scheduled_at.isoformat() if m.scheduled_at else None
+        return obj
+    
+    incoming_out = [match_to_notif(m, "challenge" if m.status == "INVITE_PENDING" else "counter") for m in incoming]
+    active_out = [match_to_notif(m, "active") for m in active]
+    paused_out = [match_to_notif(m, "paused") for m in paused]
+    result_out = [match_to_notif(m, "result_pending") for m in result_pending]
+    
+    total_pending = len(incoming) + len(result_pending)
+    
+    return {
+        "incoming_challenges": incoming_out,
+        "active_matches": active_out,
+        "paused_matches": paused_out,
+        "results_waiting_for_me": result_out,
+        "pending_count": total_pending
+    }
 
 # ─── GUEST INVITES ────────────────────────────────────────────
 @app.post("/invites/guest")
@@ -1109,7 +1420,7 @@ def create_league(req: CreateLeagueRequest, player: PlayerProfile = Depends(get_
     user = db.query(User).filter(User.id == player.user_id).first()
     if not user.is_venue_owner:
         user.is_venue_owner = True
-        db.commit()  # commit user flag immediately
+        db.commit()
 
     venue_id_parsed = resolve_venue_id(req.venue_id, db)
     sport = db.query(Sport).filter(Sport.slug == "pool").first()
@@ -1161,7 +1472,6 @@ def add_league_player(league_id: str, req: AddLeaguePlayerRequest, player: Playe
     db.commit()
     return {"success": True, "player_id": str(target.id), "league_id": league_id}
 
-# FIX 1: Missing league endpoints
 @app.post("/leagues/{league_id}/join")
 def join_league(league_id: str, req: JoinLeagueRequest = None, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     league = db.query(League).filter(League.id == uuid.UUID(league_id)).first()
@@ -1216,7 +1526,6 @@ def my_leagues(player: PlayerProfile = Depends(get_current_player), db: Session 
 
 @app.post("/leagues/approve")
 def approve_league_join(req: ApproveJoinRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
-    # If league_id omitted, find the pending request in leagues this player administers
     if req.league_id:
         membership = db.query(PlayerLeague).filter(
             PlayerLeague.player_id == uuid.UUID(req.player_id),
@@ -1352,27 +1661,19 @@ def get_my_rivalries(db: Session = Depends(get_db), player: PlayerProfile = Depe
 
 
 # ─── ADMIN: ONE-TIME DATA MIGRATION ───────────────────────────
-# Run this once after adding the suburb column, then remove.
-
 @app.post("/admin/migrate-suburbs")
 def migrate_suburbs(admin_token: str = Query(...), db: Session = Depends(get_db)):
-    """One-time migration: add suburb column + move suburb values out of city field.
-    Requires admin_secret query param for safety."""
     if admin_token != os.getenv("ADMIN_SECRET", "rankd-admin-2026"):
         raise HTTPException(status_code=403, detail="Invalid admin token")
 
     from sqlalchemy import text
-    # Step 1: Add suburb column if it doesn't exist
     try:
         db.execute(text("ALTER TABLE player_profiles ADD COLUMN IF NOT EXISTS suburb VARCHAR(100)"))
         db.execute(text("ALTER TABLE venues ADD COLUMN IF NOT EXISTS suburb VARCHAR(100)"))
         db.commit()
     except Exception as e:
         db.rollback()
-        # Column might already exist, continue
-        pass
 
-    # Step 2: Canonicalize existing data
     updated = 0
     profiles = db.query(PlayerProfile).all()
     for p in profiles:
