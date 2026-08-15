@@ -1199,14 +1199,12 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
     score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
     score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
 
-    winner_id = match.proposed_winner_id
-    if not winner_id:
-        if score_p1 > score_p2:
-            winner_id = p1_id
-        elif score_p2 > score_p1:
-            winner_id = p2_id
-        else:
-            winner_id = None
+    if score_p1 > score_p2:
+        winner_id = p1_id
+    elif score_p2 > score_p1:
+        winner_id = p2_id
+    else:
+        winner_id = None
 
     rating_result = None
 
