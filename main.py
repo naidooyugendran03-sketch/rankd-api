@@ -233,7 +233,7 @@ def build_match_response(match: Match, db: Session):
         })
 
     score = {"player_1": 0, "player_2": 0}
-    target_wins = (match.format_value // 2) + 1
+    target_wins = match.format_value
     players_ordered = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(players_ordered) >= 2:
         p1_id = players_ordered[0].player_id
@@ -891,7 +891,7 @@ def record_rack(match_id: str, req: RecordRackRequest, player: PlayerProfile = D
     if winner_id not in participant_ids:
         raise HTTPException(status_code=400, detail="Winner must be a match participant")
     
-    target_wins = (match.format_value // 2) + 1
+    target_wins = match.format_value
     current_racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
     scores = {}
     for p in participants:
@@ -1033,7 +1033,7 @@ def forfeit_match(
         if r.winner_player_id == p2.player_id
     )
 
-    target = (match.format_value // 2) + 1
+    target = match.format_value
 
     if winner.player_id == p1.player_id:
         score_p1 = target
@@ -1082,7 +1082,8 @@ def forfeit_match(
                 db
             )
         except Exception as e:
-            print(f"Forfeit rating calculation failed: {e}")
+            print(f"CRITICAL RATING FAILURE (forfeit) match={match.id} error={repr(e)}")
+            raise
 
     try:
         update_rivalry(
@@ -1092,7 +1093,8 @@ def forfeit_match(
             db
         )
     except Exception as e:
-        print(f"Forfeit rivalry update failed: {e}")
+        print(f"CRITICAL RIVALRY FAILURE (forfeit) match={match.id} error={repr(e)}")
+            raise
 
     winner_profile = (
         db.query(PlayerProfile)
@@ -1149,7 +1151,7 @@ def propose_result(match_id: str, player: PlayerProfile = Depends(get_current_pl
     p2_id = players[1].player_id
     score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
     score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
-    target = (match.format_value // 2) + 1
+    target = match.format_value
     
     if score_p1 < target and score_p2 < target:
         raise HTTPException(status_code=400, detail=f"Match is not complete. Need {target} wins to finish.")
@@ -1180,7 +1182,7 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
     p2_id = players[1].player_id
     score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
     score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
-    target = (match.format_value // 2) + 1
+    target = match.format_value
     if score_p1 < target and score_p2 < target:
         raise HTTPException(status_code=400, detail="Result is no longer valid")
     
@@ -1215,11 +1217,13 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
             try:
                 calculate_ratings(match, score_p1, score_p2, db)
             except Exception as e:
-                print(f"Rating calculation failed: {e}")
+                print(f"CRITICAL RATING FAILURE match={match.id} error={repr(e)}")
+            raise
         try:
             update_rivalry(match, score_p1, score_p2, db)
         except Exception as e:
-            print(f"Rivalry update failed: {e}")
+            print(f"CRITICAL RIVALRY FAILURE match={match.id} error={repr(e)}")
+            raise
     else:
         db.commit()
     
@@ -1345,6 +1349,34 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
     db.commit()
     return {"match_id": match_id, "status": match.status}
 
+def get_unique_opponent_ids(player_id: uuid.UUID, db: Session) -> set:
+    """
+    Return the actual IDs of every unique opponent this player
+    has completed a confirmed match against.
+    """
+    my_matches = (
+        db.query(MatchPlayer.match_id)
+        .filter(MatchPlayer.player_id == player_id)
+        .subquery()
+    )
+
+    opponent_rows = (
+        db.query(MatchPlayer.player_id)
+        .join(
+            ConfirmedResult,
+            ConfirmedResult.match_id == MatchPlayer.match_id
+        )
+        .filter(
+            MatchPlayer.match_id.in_(my_matches),
+            MatchPlayer.player_id != player_id
+        )
+        .distinct()
+        .all()
+    )
+
+    return {str(row[0]) for row in opponent_rows}
+
+
 def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(players) != 2:
@@ -1362,20 +1394,26 @@ def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
     s1.matches_played = rp1.matches_played
     s2.matches_played = rp2.matches_played
 
-    s1.unique_opponents = getattr(rp1, 'unique_opponents', 0) or 0
-    s2.unique_opponents = getattr(rp2, 'unique_opponents', 0) or 0
+    s1.unique_opponents = get_unique_opponent_ids(
+        players[0].player_id,
+        db
+    )
+    s2.unique_opponents = get_unique_opponent_ids(
+        players[1].player_id,
+        db
+    )
 
     result = engine_service.calculate_match(p1_id, p2_id, score_a, score_b, match_id=str(match.id))
 
     rp1.mu = s1.mu; rp1.phi = s1.phi; rp1.volatility = s1.volatility
     rp1.matches_played = s1.matches_played; rp1.status = s1.status
     rp1.public_rating = s1.public_rating_display; rp1.last_match_at = datetime.utcnow()
-    rp1.unique_opponents = getattr(s1, 'unique_opponents', rp1.unique_opponents or 0)
+    rp1.unique_opponents = len(s1.unique_opponents)
 
     rp2.mu = s2.mu; rp2.phi = s2.phi; rp2.volatility = s2.volatility
     rp2.matches_played = s2.matches_played; rp2.status = s2.status
     rp2.public_rating = s2.public_rating_display; rp2.last_match_at = datetime.utcnow()
-    rp2.unique_opponents = getattr(s2, 'unique_opponents', rp2.unique_opponents or 0)
+    rp2.unique_opponents = len(s2.unique_opponents)
 
     events = getattr(engine_service, 'rating_events', [])
     recent_events = events[-2:] if len(events) >= 2 else events
