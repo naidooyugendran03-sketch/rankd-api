@@ -116,8 +116,18 @@ class Match(Base):
     declined_by_id = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=True)
     proposal_count = Column(Integer, default=0)
 
+    # NEW: Live match flow fields
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    paused_at = Column(DateTime(timezone=True), nullable=True)
+    result_proposed_by = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=True)
+    result_proposed_at = Column(DateTime(timezone=True), nullable=True)
+    result_confirmed_by = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=True)
+    result_denied_by = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=True)
+    result_denied_at = Column(DateTime(timezone=True), nullable=True)
+
     players = relationship("MatchPlayer", back_populates="match", cascade="all, delete-orphan")
     submissions = relationship("ResultSubmission", back_populates="match", cascade="all, delete-orphan")
+    racks = relationship("MatchRack", back_populates="match", cascade="all, delete-orphan", order_by="MatchRack.rack_number")
 
 class MatchPlayer(Base):
     __tablename__ = "match_players"
@@ -129,6 +139,49 @@ class MatchPlayer(Base):
     __table_args__ = (UniqueConstraint("match_id", "player_slot"),)
 
     match = relationship("Match", back_populates="players")
+
+class MatchRack(Base):
+    __tablename__ = "match_racks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    match_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("matches.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    rack_number = Column(Integer, nullable=False)
+
+    winner_player_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("player_profiles.id"),
+        nullable=False
+    )
+
+    recorded_by_player_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("player_profiles.id"),
+        nullable=False
+    )
+
+    created_at = Column(DateTime(timezone=True), default=now)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=now,
+        onupdate=now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "match_id",
+            "rack_number",
+            name="uq_match_rack"
+        ),
+    )
+
+    match = relationship("Match", back_populates="racks")
 
 class ResultSubmission(Base):
     __tablename__ = "result_submissions"
