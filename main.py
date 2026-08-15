@@ -1220,7 +1220,6 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
             player_a_score=score_p1,
             player_b_score=score_p2,
             winner_id=winner_id,
-            confirmed_by=player.id,
             confirmed_at=datetime.utcnow()
         )
         db.add(confirmed)
