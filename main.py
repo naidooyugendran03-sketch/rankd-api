@@ -1083,7 +1083,6 @@ def forfeit_match(
             )
         except Exception as e:
             print(f"CRITICAL RATING FAILURE (forfeit) match={match.id} error={repr(e)}")
-            raise
 
     try:
         update_rivalry(
@@ -1094,7 +1093,6 @@ def forfeit_match(
         )
     except Exception as e:
         print(f"CRITICAL RIVALRY FAILURE (forfeit) match={match.id} error={repr(e)}")
-            raise
 
     winner_profile = (
         db.query(PlayerProfile)
@@ -1218,12 +1216,10 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
                 calculate_ratings(match, score_p1, score_p2, db)
             except Exception as e:
                 print(f"CRITICAL RATING FAILURE match={match.id} error={repr(e)}")
-            raise
         try:
             update_rivalry(match, score_p1, score_p2, db)
         except Exception as e:
             print(f"CRITICAL RIVALRY FAILURE match={match.id} error={repr(e)}")
-            raise
     else:
         db.commit()
     
@@ -1378,6 +1374,11 @@ def get_unique_opponent_ids(player_id: uuid.UUID, db: Session) -> set:
 
 
 def calculate_ratings(match: Match, score_a: int, score_b: int, db: Session):
+    # HARD SAFETY RULE: Friendly matches NEVER affect RANKD rating.
+    if match.context == "FRIENDLY":
+        return
+    if not match.rating_eligible:
+        return
     players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
     if len(players) != 2:
         return
@@ -1902,6 +1903,149 @@ def migrate_suburbs(admin_token: str = Query(...), db: Session = Depends(get_db)
     }
 
 # ─── RUN ──────────────────────────────────────────────────────
+
+@app.get("/matches/my/history")
+def get_my_match_history(
+    limit: int = 10,
+    player: PlayerProfile = Depends(get_current_player),
+    db: Session = Depends(get_db)
+):
+    player_matches = (
+        db.query(MatchPlayer)
+        .filter(MatchPlayer.player_id == player.id)
+        .all()
+    )
+
+    match_ids = [mp.match_id for mp in player_matches]
+
+    if not match_ids:
+        return {"matches": []}
+
+    matches = (
+        db.query(Match)
+        .filter(
+            Match.id.in_(match_ids),
+            Match.status == "CONFIRMED"
+        )
+        .order_by(Match.confirmed_at.desc())
+        .limit(min(limit, 50))
+        .all()
+    )
+
+    output = []
+
+    for match in matches:
+        players = (
+            db.query(MatchPlayer)
+            .filter(MatchPlayer.match_id == match.id)
+            .order_by(MatchPlayer.player_slot)
+            .all()
+        )
+
+        if len(players) != 2:
+            continue
+
+        p1 = players[0]
+        p2 = players[1]
+
+        opponent_mp = (
+            p2 if p1.player_id == player.id else p1
+        )
+
+        opponent = (
+            db.query(PlayerProfile)
+            .filter(PlayerProfile.id == opponent_mp.player_id)
+            .first()
+        )
+
+        confirmed = (
+            db.query(ConfirmedResult)
+            .filter(ConfirmedResult.match_id == match.id)
+            .first()
+        )
+
+        if not confirmed:
+            continue
+
+        is_p1 = p1.player_id == player.id
+
+        my_score = (
+            confirmed.player_a_score
+            if is_p1
+            else confirmed.player_b_score
+        )
+
+        opponent_score = (
+            confirmed.player_b_score
+            if is_p1
+            else confirmed.player_a_score
+        )
+
+        if confirmed.winner_id == player.id:
+            result = "WIN"
+        elif confirmed.winner_id is None:
+            result = "DRAW"
+        else:
+            result = "LOSS"
+
+        rating_event = (
+            db.query(RatingEvent)
+            .filter(
+                RatingEvent.match_id == match.id,
+                RatingEvent.player_id == player.id
+            )
+            .first()
+        )
+
+        rating_change = (
+            rating_event.delta
+            if rating_event else 0
+        )
+
+        output.append({
+            "match_id": str(match.id),
+
+            "opponent": {
+                "id": str(opponent.id) if opponent else None,
+                "name": (
+                    f"{opponent.first_name} {opponent.last_name}"
+                    if opponent else "Opponent"
+                ),
+                "username": (
+                    opponent.username if opponent else None
+                )
+            },
+
+            "result": result,
+
+            "score": {
+                "me": my_score,
+                "opponent": opponent_score
+            },
+
+            "context": match.context,
+
+            "race_to": match.format_value,
+
+            "rated": bool(
+                match.rating_eligible
+                and match.context != "FRIENDLY"
+            ),
+
+            "rating_change": (
+                rating_change
+                if match.context != "FRIENDLY"
+                else 0
+            ),
+
+            "played_at": (
+                match.confirmed_at.isoformat()
+                if match.confirmed_at else None
+            )
+        })
+
+    return {"matches": output}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
