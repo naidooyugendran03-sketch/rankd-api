@@ -1306,8 +1306,7 @@ def get_my_active_matches(
             Match.id.in_(match_ids),
             Match.status.in_([
                 "ACTIVE",
-                "PAUSED",
-                "RESULT_PENDING"
+                "PAUSED"
             ])
         )
         .order_by(Match.updated_at.desc())
@@ -1398,6 +1397,35 @@ def get_my_active_matches(
             if opponent_mp
             and r.winner_player_id == opponent_mp.player_id
         )
+
+        # Score-completion guard: a PAUSED match that has already
+        # reached its Race-to target should never be resumable.
+        if match.status == "PAUSED":
+            target = match.format_value or 5
+
+            players_for_match = (
+                db.query(MatchPlayer)
+                .filter(MatchPlayer.match_id == match.id)
+                .order_by(MatchPlayer.player_slot)
+                .all()
+            )
+
+            if len(players_for_match) == 2:
+                p1_id = players_for_match[0].player_id
+                p2_id = players_for_match[1].player_id
+
+                p1_score = sum(
+                    1 for r in racks
+                    if r.winner_player_id == p1_id
+                )
+
+                p2_score = sum(
+                    1 for r in racks
+                    if r.winner_player_id == p2_id
+                )
+
+                if p1_score >= target or p2_score >= target:
+                    continue
 
         venue_name = None
 
@@ -1779,6 +1807,55 @@ def get_notifications(player: PlayerProfile = Depends(get_current_player), db: S
     
     incoming_out = [match_to_notif(m, "challenge" if m.status == "INVITE_PENDING" else "counter") for m in incoming]
     active_out = [match_to_notif(m, "active") for m in active]
+    # Clean stale paused matches that already have a ConfirmedResult
+    # or have already reached their Race-to target.
+    clean_paused = []
+    for m in paused:
+        confirmed = (
+            db.query(ConfirmedResult)
+            .filter(ConfirmedResult.match_id == m.id)
+            .first()
+        )
+        if confirmed:
+            m.status = "CONFIRMED"
+            if not m.confirmed_at:
+                m.confirmed_at = (
+                    confirmed.confirmed_at
+                    or datetime.utcnow()
+                )
+            continue
+
+        # Score-completion guard
+        target = m.format_value or 5
+        mps_for_match = (
+            db.query(MatchPlayer)
+            .filter(MatchPlayer.match_id == m.id)
+            .order_by(MatchPlayer.player_slot)
+            .all()
+        )
+        if len(mps_for_match) == 2:
+            mp1_id = mps_for_match[0].player_id
+            mp2_id = mps_for_match[1].player_id
+            m_racks = (
+                db.query(MatchRack)
+                .filter(MatchRack.match_id == m.id)
+                .all()
+            )
+            mp1_score = sum(
+                1 for r in m_racks
+                if r.winner_player_id == mp1_id
+            )
+            mp2_score = sum(
+                1 for r in m_racks
+                if r.winner_player_id == mp2_id
+            )
+            if mp1_score >= target or mp2_score >= target:
+                continue
+
+        clean_paused.append(m)
+    db.commit()
+    paused = clean_paused
+
     paused_out = [match_to_notif(m, "paused") for m in paused]
     result_out = [match_to_notif(m, "result_pending") for m in result_pending]
     
