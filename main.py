@@ -456,8 +456,37 @@ def verify_pin(
         raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
     user.pin_attempts = 0
     db.commit()
+
+    # Return the current player in the same response so the frontend can
+    # open Home immediately instead of blocking on a second /players/me call.
+    profile = db.query(PlayerProfile).filter(PlayerProfile.user_id == user.id).first()
+    rating = db.query(RatingProfile).filter(RatingProfile.player_id == profile.id).first() if profile else None
+    player_data = None
+    if profile:
+        stats = get_player_stats(profile.id, db)
+        player_data = {
+            "id": str(profile.id),
+            "first_name": profile.first_name,
+            "last_name": profile.last_name,
+            "username": profile.username,
+            "rankd_code": profile.rankd_code,
+            "city": profile.city,
+            "suburb": profile.suburb,
+            "province": profile.province,
+            "country": profile.country,
+            "street_address": profile.street_address,
+            "rating": rating.public_rating if rating else 800,
+            "public_rating": rating.public_rating if rating else 800,
+            "status": rating.status if rating else "UNRANKD",
+            "matches_played": rating.matches_played if rating else 0,
+            "placement_matches": rating.matches_played if rating else 0,
+            "placement_total": 10,
+            "unique_opponents": rating.unique_opponents if rating else 0,
+            **stats,
+        }
+
     fresh_token = create_access_token({"sub": str(user.id)})
-    return {"token": fresh_token, "valid": True}
+    return {"token": fresh_token, "valid": True, "player": player_data}
 
 @app.post("/auth/pin/reset")
 def reset_pin(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
