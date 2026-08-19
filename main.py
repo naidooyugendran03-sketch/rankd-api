@@ -399,6 +399,35 @@ class SetPinRequest(BaseModel):
 class VerifyPinRequest(BaseModel):
     pin: str = Field(..., min_length=4, max_length=4)
 
+class PinLoginRequest(BaseModel):
+    mobile_number: str
+    pin: str = Field(..., min_length=4, max_length=4, pattern=r"^\d{4}$")
+
+def build_auth_player(profile: Optional[PlayerProfile], db: Session):
+    """Return the lightweight player payload needed immediately after authentication."""
+    if not profile:
+        return None
+    rating = db.query(RatingProfile).filter(RatingProfile.player_id == profile.id).first()
+    return {
+        "id": str(profile.id),
+        "first_name": profile.first_name,
+        "last_name": profile.last_name,
+        "username": profile.username,
+        "rankd_code": profile.rankd_code,
+        "city": profile.city,
+        "suburb": profile.suburb,
+        "province": profile.province,
+        "country": profile.country,
+        "street_address": profile.street_address,
+        "rating": rating.public_rating if rating else 800,
+        "public_rating": rating.public_rating if rating else 800,
+        "status": rating.status if rating else "UNRANKD",
+        "matches_played": rating.matches_played if rating else 0,
+        "placement_matches": rating.matches_played if rating else 0,
+        "placement_total": 10,
+        "unique_opponents": rating.unique_opponents if rating else 0,
+    }
+
 # ─── PIN AUTH ─────────────────────────────────────────────────
 WEAK_PINS = {
     "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999",
@@ -455,38 +484,39 @@ def verify_pin(
         remaining = 5 - user.pin_attempts
         raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
     user.pin_attempts = 0
+    user.pin_locked_until = None
     db.commit()
-
-    # Return the current player in the same response so the frontend can
-    # open Home immediately instead of blocking on a second /players/me call.
-    profile = db.query(PlayerProfile).filter(PlayerProfile.user_id == user.id).first()
-    rating = db.query(RatingProfile).filter(RatingProfile.player_id == profile.id).first() if profile else None
-    player_data = None
-    if profile:
-        stats = get_player_stats(profile.id, db)
-        player_data = {
-            "id": str(profile.id),
-            "first_name": profile.first_name,
-            "last_name": profile.last_name,
-            "username": profile.username,
-            "rankd_code": profile.rankd_code,
-            "city": profile.city,
-            "suburb": profile.suburb,
-            "province": profile.province,
-            "country": profile.country,
-            "street_address": profile.street_address,
-            "rating": rating.public_rating if rating else 800,
-            "public_rating": rating.public_rating if rating else 800,
-            "status": rating.status if rating else "UNRANKD",
-            "matches_played": rating.matches_played if rating else 0,
-            "placement_matches": rating.matches_played if rating else 0,
-            "placement_total": 10,
-            "unique_opponents": rating.unique_opponents if rating else 0,
-            **stats,
-        }
-
     fresh_token = create_access_token({"sub": str(user.id)})
-    return {"token": fresh_token, "valid": True, "player": player_data}
+    profile = db.query(PlayerProfile).filter(PlayerProfile.user_id == user.id).first()
+    return {"token": fresh_token, "valid": True, "player": build_auth_player(profile, db)}
+
+@app.post("/auth/pin/login")
+def pin_login(req: PinLoginRequest, db: Session = Depends(get_db)):
+    """Fast returning-user login: mobile number + PIN in one request."""
+    mobile = req.mobile_number.strip()
+    user = db.query(User).filter(User.mobile_number == mobile).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.pin_locked_until and user.pin_locked_until > datetime.utcnow():
+        raise HTTPException(status_code=403, detail="PIN locked. Use mobile OTP to unlock.")
+    if not user.pin_hash:
+        raise HTTPException(status_code=400, detail="No PIN set. Use mobile OTP.")
+    if not pwd_context.verify(req.pin, user.pin_hash):
+        user.pin_attempts = (user.pin_attempts or 0) + 1
+        if user.pin_attempts >= 5:
+            user.pin_locked_until = datetime.utcnow() + timedelta(minutes=30)
+            db.commit()
+            raise HTTPException(status_code=403, detail="Too many failed attempts. PIN locked for 30 minutes. Use mobile OTP.")
+        db.commit()
+        remaining = 5 - user.pin_attempts
+        raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
+
+    user.pin_attempts = 0
+    user.pin_locked_until = None
+    db.commit()
+    profile = db.query(PlayerProfile).filter(PlayerProfile.user_id == user.id).first()
+    token = create_access_token({"sub": str(user.id)})
+    return {"token": token, "valid": True, "player": build_auth_player(profile, db)}
 
 @app.post("/auth/pin/reset")
 def reset_pin(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
