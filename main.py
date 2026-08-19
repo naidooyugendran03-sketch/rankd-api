@@ -428,6 +428,27 @@ def build_auth_player(profile: Optional[PlayerProfile], db: Session):
         "unique_opponents": rating.unique_opponents if rating else 0,
     }
 
+def build_home_bootstrap(profile: Optional[PlayerProfile], db: Session):
+    """Build the first Home payload inside the login request so the browser has no post-login waterfall."""
+    if not profile:
+        return {"active": {"matches": []}, "history": {"matches": []}, "notifications": {"incoming_challenges": [], "active_matches": [], "paused_matches": [], "results_waiting_for_me": [], "pending_count": 0}}
+    try:
+        active = get_my_active_matches(player=profile, db=db)
+    except Exception as exc:
+        print(f"HOME BOOTSTRAP active failed: {exc!r}")
+        active = {"matches": []}
+    try:
+        history = get_my_match_history(limit=10, player=profile, db=db)
+    except Exception as exc:
+        print(f"HOME BOOTSTRAP history failed: {exc!r}")
+        history = {"matches": []}
+    try:
+        notifications = get_notifications(player=profile, db=db)
+    except Exception as exc:
+        print(f"HOME BOOTSTRAP notifications failed: {exc!r}")
+        notifications = {"incoming_challenges": [], "active_matches": [], "paused_matches": [], "results_waiting_for_me": [], "pending_count": 0}
+    return {"active": active, "history": history, "notifications": notifications}
+
 # ─── PIN AUTH ─────────────────────────────────────────────────
 WEAK_PINS = {
     "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999",
@@ -488,7 +509,7 @@ def verify_pin(
     db.commit()
     fresh_token = create_access_token({"sub": str(user.id)})
     profile = db.query(PlayerProfile).filter(PlayerProfile.user_id == user.id).first()
-    return {"token": fresh_token, "valid": True, "player": build_auth_player(profile, db)}
+    return {"token": fresh_token, "valid": True, "player": build_auth_player(profile, db), "home": build_home_bootstrap(profile, db)}
 
 @app.post("/auth/pin/login")
 def pin_login(req: PinLoginRequest, db: Session = Depends(get_db)):
@@ -516,7 +537,7 @@ def pin_login(req: PinLoginRequest, db: Session = Depends(get_db)):
     db.commit()
     profile = db.query(PlayerProfile).filter(PlayerProfile.user_id == user.id).first()
     token = create_access_token({"sub": str(user.id)})
-    return {"token": token, "valid": True, "player": build_auth_player(profile, db)}
+    return {"token": token, "valid": True, "player": build_auth_player(profile, db), "home": build_home_bootstrap(profile, db)}
 
 @app.post("/auth/pin/reset")
 def reset_pin(player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
