@@ -1270,72 +1270,64 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
     if match.result_proposed_by == player.id:
         raise HTTPException(status_code=400, detail="You cannot accept your own result")
 
-    racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
-    players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
+    players = db.query(MatchPlayer).filter(
+        MatchPlayer.match_id == match.id
+    ).order_by(MatchPlayer.player_slot).all()
     if len(players) != 2:
         raise HTTPException(status_code=400, detail="Invalid match")
+
+    # Manual result proposals are stored in ResultSubmission. Live-rack proposals
+    # fall back to the recorded rack score.
+    proposal = None
+    if match.result_proposed_by:
+        proposal = db.query(ResultSubmission).filter(
+            ResultSubmission.match_id == match.id,
+            ResultSubmission.player_id == match.result_proposed_by
+        ).first()
+
+    if proposal:
+        score_p1 = proposal.player_a_score
+        score_p2 = proposal.player_b_score
+    else:
+        racks = db.query(MatchRack).filter(MatchRack.match_id == match.id).all()
+        p1_id = players[0].player_id
+        p2_id = players[1].player_id
+        score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
+        score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
+
     p1_id = players[0].player_id
     p2_id = players[1].player_id
-    score_p1 = sum(1 for r in racks if r.winner_player_id == p1_id)
-    score_p2 = sum(1 for r in racks if r.winner_player_id == p2_id)
+    winner_id = p1_id if score_p1 > score_p2 else p2_id if score_p2 > score_p1 else None
+    if winner_id is None:
+        raise HTTPException(status_code=400, detail="Result cannot be confirmed as a draw")
 
-    if score_p1 > score_p2:
-        winner_id = p1_id
-    elif score_p2 > score_p1:
-        winner_id = p2_id
-    else:
-        winner_id = None
-
-    rating_result = None
-
-    existing_confirmed = (
-        db.query(ConfirmedResult)
-        .filter(ConfirmedResult.match_id == match.id)
-        .first()
-    )
-
+    existing_confirmed = db.query(ConfirmedResult).filter(
+        ConfirmedResult.match_id == match.id
+    ).first()
     if not existing_confirmed:
-        confirmed = ConfirmedResult(
+        db.add(ConfirmedResult(
             match_id=match.id,
             player_a_score=score_p1,
             player_b_score=score_p2,
             winner_id=winner_id,
             confirmed_at=datetime.utcnow()
-        )
-        db.add(confirmed)
+        ))
 
     match.status = "CONFIRMED"
     match.confirmed_at = datetime.utcnow()
     match.confirmed_by = player.id
     match.winner_id = winner_id
-
     for mp in players:
         mp.is_winner = (mp.player_id == winner_id)
-
     db.commit()
 
-    if (
-        match.rating_eligible
-        and match.context != "FRIENDLY"
-    ):
+    rating_result = None
+    if match.rating_eligible and match.context != "FRIENDLY":
         try:
-            rating_result = calculate_ratings(
-                match, score_p1, score_p2, db
-            )
+            rating_result = calculate_ratings(match, score_p1, score_p2, db)
         except Exception as e:
             db.rollback()
-            print(
-                f"CRITICAL RATING FAILURE "
-                f"match={match.id} "
-                f"error={repr(e)}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"Match result saved but rating "
-                    f"calculation failed: {str(e)}"
-                )
-            )
+            raise HTTPException(status_code=500, detail=f"Match result saved but rating calculation failed: {str(e)}")
 
     try:
         update_rivalry(match, score_p1, score_p2, db)
@@ -1345,8 +1337,11 @@ def accept_result(match_id: str, player: PlayerProfile = Depends(get_current_pla
     return {
         "status": "CONFIRMED",
         "match_id": match_id,
+        "score": {"player_1": score_p1, "player_2": score_p2},
+        "winner_id": str(winner_id),
         "rating": rating_result
     }
+
 @app.post("/matches/{match_id}/result/deny")
 def deny_result(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
@@ -1356,13 +1351,19 @@ def deny_result(match_id: str, player: PlayerProfile = Depends(get_current_playe
     if match.result_proposed_by == player.id:
         raise HTTPException(status_code=400, detail="You cannot deny your own result")
     
+    proposer_id = match.result_proposed_by
     match.result_denied_by = player.id
     match.result_denied_at = datetime.utcnow()
     match.result_proposed_by = None
     match.result_proposed_at = None
     match.status = "ACTIVE"
+    if proposer_id:
+        db.query(ResultSubmission).filter(
+            ResultSubmission.match_id == match.id,
+            ResultSubmission.player_id == proposer_id
+        ).delete(synchronize_session=False)
     db.commit()
-    return {"status": "ACTIVE", "message": "Result denied. Match remains in progress."}
+    return {"status": "ACTIVE", "message": "Result disputed. Submit the corrected score or continue the match."}
 
 @app.get("/matches/my/active")
 def get_my_active_matches(
@@ -1535,19 +1536,28 @@ def get_my_active_matches(
 
 @app.post("/matches/{match_id}/result")
 def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    """Submit a score as a proposal. The opponent must explicitly accept it before confirmation."""
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
-    if not match or match.status not in ("ACTIVE", "AWAITING_RESULT", "RESULT_PARTIAL"):
-        raise HTTPException(status_code=400, detail="Match not accepting results")
-    mp = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id, MatchPlayer.player_id == player.id).first()
+    if not match or match.status not in ("ACTIVE", "AWAITING_RESULT", "RESULT_MISMATCH"):
+        raise HTTPException(status_code=400, detail="Match not accepting a result proposal")
+
+    mp = db.query(MatchPlayer).filter(
+        MatchPlayer.match_id == match.id,
+        MatchPlayer.player_id == player.id
+    ).first()
     if not mp:
         raise HTTPException(status_code=403, detail="You are not in this match")
 
+    # Store scores canonically as player-slot 1 / player-slot 2.
     if mp.player_slot == 2:
         norm_a = req.player_b_score
         norm_b = req.player_a_score
     else:
         norm_a = req.player_a_score
         norm_b = req.player_b_score
+
+    if norm_a == norm_b:
+        raise HTTPException(status_code=400, detail="A completed match cannot end in a draw")
 
     existing_sub = db.query(ResultSubmission).filter(
         ResultSubmission.match_id == match.id,
@@ -1556,42 +1566,25 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
     if existing_sub:
         existing_sub.player_a_score = norm_a
         existing_sub.player_b_score = norm_b
-        existing_sub.revision += 1
+        existing_sub.revision = (existing_sub.revision or 0) + 1
     else:
         db.add(ResultSubmission(
-            match_id=match.id, player_id=player.id,
-            player_a_score=norm_a, player_b_score=norm_b
+            match_id=match.id,
+            player_id=player.id,
+            player_a_score=norm_a,
+            player_b_score=norm_b
         ))
 
-    all_subs = db.query(ResultSubmission).filter(ResultSubmission.match_id == match.id).all()
-    if len(all_subs) == 1:
-        match.status = "RESULT_PARTIAL"
-    elif len(all_subs) >= 2:
-        if all_subs[0].player_a_score == all_subs[1].player_a_score and all_subs[0].player_b_score == all_subs[1].player_b_score:
-            match.status = "CONFIRMED"
-            match.confirmed_at = datetime.utcnow()
-
-            players_ordered = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).order_by(MatchPlayer.player_slot).all()
-            winner_id = None
-            if norm_a > norm_b:
-                winner_id = players_ordered[0].player_id
-            elif norm_b > norm_a:
-                winner_id = players_ordered[1].player_id
-
-            db.add(ConfirmedResult(
-                match_id=match.id,
-                player_a_score=norm_a,
-                player_b_score=norm_b,
-                winner_id=winner_id,
-                confirmed_by_algorithm=True
-            ))
-            if match.rating_eligible:
-                calculate_ratings(match, norm_a, norm_b, db)
-            update_rivalry(match, norm_a, norm_b, db)
-        else:
-            match.status = "RESULT_MISMATCH"
+    match.status = "RESULT_PENDING"
+    match.result_proposed_by = player.id
+    match.result_proposed_at = datetime.utcnow()
     db.commit()
-    return {"match_id": match_id, "status": match.status}
+
+    return {
+        "match_id": match_id,
+        "status": "RESULT_PENDING",
+        "score": {"player_1": norm_a, "player_2": norm_b}
+    }
 
 def get_unique_opponent_ids(player_id: uuid.UUID, db: Session) -> set:
     """
@@ -1863,6 +1856,20 @@ def get_notifications(player: PlayerProfile = Depends(get_current_player), db: S
         if opponent_mp:
             opp_score = sum(1 for r in racks if r.winner_player_id == opponent_mp.player_id)
         
+        if ntype == "result_pending" and m.result_proposed_by:
+            proposal = db.query(ResultSubmission).filter(
+                ResultSubmission.match_id == m.id,
+                ResultSubmission.player_id == m.result_proposed_by
+            ).first()
+            if proposal and opponent_mp:
+                my_mp = next((mp for mp in all_mps if mp.player_id == player.id), None)
+                if my_mp and my_mp.player_slot == 1:
+                    my_score = proposal.player_a_score
+                    opp_score = proposal.player_b_score
+                elif my_mp:
+                    my_score = proposal.player_b_score
+                    opp_score = proposal.player_a_score
+
         obj = {
             "match_id": str(m.id),
             "type": ntype,
