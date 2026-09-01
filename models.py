@@ -340,3 +340,69 @@ class EventAttendance(Base):
     is_open_to_challenges = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=now)
     __table_args__ = (UniqueConstraint("event_id", "player_id"),)
+
+
+class Tournament(Base):
+    __tablename__ = "tournaments"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), nullable=False)
+    venue_id = Column(UUID(as_uuid=True), ForeignKey("venues.id"), nullable=True)
+    location_name = Column(String(160), nullable=True)
+    city = Column(String(100), nullable=True)
+    province = Column(String(100), nullable=True)
+    scheduled_at = Column(DateTime(timezone=True), nullable=False)
+    registration_closes_at = Column(DateTime(timezone=True), nullable=True)
+    check_in_closes_at = Column(DateTime(timezone=True), nullable=True)
+    max_players = Column(Integer, nullable=False, default=16)
+    entry_fee_cents = Column(Integer, nullable=False, default=0)
+    platform_fee_cents = Column(Integer, nullable=False, default=1000)
+    prize_info = Column(String(255), nullable=True)
+    format_type = Column(String(30), nullable=False, default="SINGLE_ELIMINATION")
+    race_to = Column(Integer, nullable=False, default=5)
+    draw_type = Column(String(20), nullable=False, default="SEEDED")
+    ranked = Column(Boolean, nullable=False, default=True)
+    rules = Column(Text, nullable=True)
+    available_tables = Column(Integer, nullable=False, default=1)
+    status = Column(String(30), nullable=False, default="REGISTRATION_OPEN")
+    created_by = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=now)
+    updated_at = Column(DateTime(timezone=True), default=now, onupdate=now)
+
+    entries = relationship("TournamentEntry", back_populates="tournament", cascade="all, delete-orphan")
+    bracket_matches = relationship("TournamentBracketMatch", back_populates="tournament", cascade="all, delete-orphan")
+
+
+class TournamentEntry(Base):
+    __tablename__ = "tournament_entries"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tournament_id = Column(UUID(as_uuid=True), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
+    player_id = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(20), nullable=False, default="REGISTERED")
+    seed = Column(Integer, nullable=True)
+    checked_in_at = Column(DateTime(timezone=True), nullable=True)
+    joined_at = Column(DateTime(timezone=True), default=now)
+    waitlist_position = Column(Integer, nullable=True)
+    __table_args__ = (UniqueConstraint("tournament_id", "player_id", name="uq_tournament_player"),)
+
+    tournament = relationship("Tournament", back_populates="entries")
+
+
+class TournamentBracketMatch(Base):
+    __tablename__ = "tournament_bracket_matches"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tournament_id = Column(UUID(as_uuid=True), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
+    round_number = Column(Integer, nullable=False)
+    match_number = Column(Integer, nullable=False)
+    player1_id = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=True)
+    player2_id = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=True)
+    player1_score = Column(Integer, nullable=True)
+    player2_score = Column(Integer, nullable=True)
+    winner_id = Column(UUID(as_uuid=True), ForeignKey("player_profiles.id"), nullable=True)
+    table_number = Column(Integer, nullable=True)
+    status = Column(String(20), nullable=False, default="PENDING")
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=now)
+    __table_args__ = (UniqueConstraint("tournament_id", "round_number", "match_number", name="uq_tournament_round_match"),)
+
+    tournament = relationship("Tournament", back_populates="bracket_matches")

@@ -18,7 +18,8 @@ from database import engine, get_db, Base
 from models import (
     User, PlayerProfile, Sport, Discipline, Venue, League, Team, PlayerLeague,
     Match, MatchPlayer, MatchRack, ResultSubmission, ConfirmedResult, RatingProfile,
-    RatingEvent, Rivalry, GuestInvite, RankdNight, EventAttendance
+    RatingEvent, Rivalry, GuestInvite, RankdNight, EventAttendance,
+    Tournament, TournamentEntry, TournamentBracketMatch
 )
 from engine import RankdEngine, AlgorithmConfig
 
@@ -351,7 +352,7 @@ class CounterProposalRequest(BaseModel):
     venue_id: Optional[str] = None
 
 class SubmitResultRequest(BaseModel):
-    match_id: str
+    match_id: Optional[str] = None
     player_a_score: int = Field(..., ge=0, le=50)
     player_b_score: int = Field(..., ge=0, le=50)
 
@@ -360,6 +361,10 @@ class RecordRackRequest(BaseModel):
 
 class UpdateRackRequest(BaseModel):
     winner_player_id: str
+
+class AdjustScoreRequest(BaseModel):
+    player_id: str
+    delta: int = Field(..., ge=-1, le=1)
 
 class CreateLeagueRequest(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
@@ -402,6 +407,31 @@ class VerifyPinRequest(BaseModel):
 class PinLoginRequest(BaseModel):
     mobile_number: str
     pin: str = Field(..., min_length=4, max_length=4, pattern=r"^\d{4}$")
+
+
+class CreateTournamentRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+    venue_id: Optional[str] = None
+    location_name: Optional[str] = Field(None, max_length=160)
+    city: Optional[str] = Field(None, max_length=100)
+    province: Optional[str] = Field(None, max_length=100)
+    scheduled_at: datetime
+    registration_closes_at: Optional[datetime] = None
+    check_in_closes_at: Optional[datetime] = None
+    max_players: int = Field(default=16, ge=4, le=128)
+    entry_fee_cents: int = Field(default=0, ge=0, le=10000000)
+    platform_fee_cents: int = Field(default=1000, ge=0, le=1000000)
+    prize_info: Optional[str] = Field(None, max_length=255)
+    race_to: int = Field(default=5, ge=1, le=50)
+    draw_type: str = Field(default="SEEDED")
+    ranked: bool = True
+    rules: Optional[str] = None
+    available_tables: int = Field(default=1, ge=1, le=100)
+
+
+class TournamentResultRequest(BaseModel):
+    player1_score: int = Field(..., ge=0, le=50)
+    player2_score: int = Field(..., ge=0, le=50)
 
 def build_auth_player(profile: Optional[PlayerProfile], db: Session):
     """Return the lightweight player payload needed immediately after authentication."""
@@ -1025,6 +1055,62 @@ def update_rack(match_id: str, rack_number: int, req: UpdateRackRequest, player:
     db.commit()
     return build_match_response(match, db)
 
+
+@app.post("/matches/{match_id}/score-adjust")
+def adjust_live_score(match_id: str, req: AdjustScoreRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    require_match_participant(match, player, db)
+    if match.status not in ("ACTIVE", "PAUSED"):
+        raise HTTPException(status_code=400, detail="Score can only be edited while the match is in progress")
+    if req.delta not in (-1, 1):
+        raise HTTPException(status_code=400, detail="Delta must be +1 or -1")
+
+    target_player_id = uuid.UUID(req.player_id)
+    participants = db.query(MatchPlayer).filter(MatchPlayer.match_id == match.id).all()
+    participant_ids = {p.player_id for p in participants}
+    if target_player_id not in participant_ids:
+        raise HTTPException(status_code=400, detail="Player must be a participant in this match")
+
+    racks = (db.query(MatchRack)
+             .filter(MatchRack.match_id == match.id)
+             .order_by(MatchRack.rack_number.asc())
+             .all())
+    target_wins = match.format_value
+    score = sum(1 for r in racks if r.winner_player_id == target_player_id)
+
+    if req.delta == 1:
+        if any(sum(1 for r in racks if r.winner_player_id == pid) >= target_wins for pid in participant_ids):
+            raise HTTPException(status_code=400, detail="Target already reached. Correct the score with minus before adding another frame.")
+        rack = MatchRack(
+            match_id=match.id,
+            rack_number=len(racks) + 1,
+            winner_player_id=target_player_id,
+            recorded_by_player_id=player.id
+        )
+        db.add(rack)
+    else:
+        if score <= 0:
+            raise HTTPException(status_code=400, detail="That player's score is already 0")
+        rack_to_remove = next((r for r in reversed(racks) if r.winner_player_id == target_player_id), None)
+        if not rack_to_remove:
+            raise HTTPException(status_code=404, detail="No recorded frame found for that player")
+        removed_number = rack_to_remove.rack_number
+        db.delete(rack_to_remove)
+        db.flush()
+        later = (db.query(MatchRack)
+                 .filter(MatchRack.match_id == match.id, MatchRack.rack_number > removed_number)
+                 .order_by(MatchRack.rack_number.asc())
+                 .all())
+        for r in later:
+            r.rack_number -= 1
+            r.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(match)
+    return build_match_response(match, db)
+
 @app.post("/matches/{match_id}/pause")
 def pause_match(match_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
@@ -1538,7 +1624,7 @@ def get_my_active_matches(
 def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
     """Submit a score as a proposal. The opponent must explicitly accept it before confirmation."""
     match = db.query(Match).filter(Match.id == uuid.UUID(match_id)).first()
-    if not match or match.status not in ("ACTIVE", "AWAITING_RESULT", "RESULT_MISMATCH"):
+    if not match or match.status not in ("ACTIVE", "AWAITING_RESULT", "RESULT_MISMATCH", "RESULT_PENDING"):
         raise HTTPException(status_code=400, detail="Match not accepting a result proposal")
 
     mp = db.query(MatchPlayer).filter(
@@ -1583,8 +1669,165 @@ def submit_result(match_id: str, req: SubmitResultRequest, player: PlayerProfile
     return {
         "match_id": match_id,
         "status": "RESULT_PENDING",
-        "score": {"player_1": norm_a, "player_2": norm_b}
+        "score": {"player_1": norm_a, "player_2": norm_b},
+        "revision": (existing_sub.revision if existing_sub else 1)
     }
+
+
+# ─── TOURNAMENTS ──────────────────────────────────────────────
+def tournament_to_dict(t: Tournament, db: Session, include_entries: bool = False):
+    venue = db.query(Venue).filter(Venue.id == t.venue_id).first() if t.venue_id else None
+    entries = db.query(TournamentEntry).filter(TournamentEntry.tournament_id == t.id).all()
+    registered = [e for e in entries if e.status in ("REGISTERED", "CHECKED_IN")]
+    waitlisted = [e for e in entries if e.status == "WAITLISTED"]
+    data = {
+        "id": str(t.id), "name": t.name, "venue_id": str(t.venue_id) if t.venue_id else None,
+        "venue": venue.name if venue else (t.location_name or "Venue TBC"),
+        "city": t.city or (venue.city if venue else None),
+        "province": t.province or (venue.province if venue else None),
+        "scheduled_at": t.scheduled_at.isoformat(),
+        "registration_closes_at": t.registration_closes_at.isoformat() if t.registration_closes_at else None,
+        "check_in_closes_at": t.check_in_closes_at.isoformat() if t.check_in_closes_at else None,
+        "max_players": t.max_players, "registered_count": len(registered), "waitlist_count": len(waitlisted),
+        "entry_fee_cents": t.entry_fee_cents, "platform_fee_cents": t.platform_fee_cents,
+        "total_fee_cents": t.entry_fee_cents + t.platform_fee_cents,
+        "prize_info": t.prize_info, "format_type": t.format_type, "race_to": t.race_to,
+        "draw_type": t.draw_type, "ranked": t.ranked, "rules": t.rules,
+        "available_tables": t.available_tables, "status": t.status, "created_by": str(t.created_by)
+    }
+    if include_entries:
+        out=[]
+        for e in entries:
+            p = db.query(PlayerProfile).filter(PlayerProfile.id == e.player_id).first()
+            rating = db.query(RatingProfile).filter(RatingProfile.player_id == e.player_id).first()
+            out.append({"player_id": str(e.player_id), "name": f"{p.first_name} {p.last_name}" if p else "Player", "username": p.username if p else None, "status": e.status, "seed": e.seed, "rating": rating.public_rating if rating else 800, "waitlist_position": e.waitlist_position})
+        data["entries"] = out
+    return data
+
+@app.get("/tournaments")
+def list_tournaments(status_filter: Optional[str] = Query(None, alias="status"), db: Session = Depends(get_db)):
+    q = db.query(Tournament)
+    if status_filter:
+        q = q.filter(Tournament.status == status_filter)
+    else:
+        q = q.filter(Tournament.status != "CANCELLED")
+    tournaments = q.order_by(Tournament.scheduled_at.asc()).all()
+    return {"tournaments": [tournament_to_dict(t, db) for t in tournaments]}
+
+@app.post("/tournaments")
+def create_tournament(req: CreateTournamentRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    draw_type = req.draw_type.upper()
+    if draw_type not in ("SEEDED", "RANDOM"):
+        raise HTTPException(status_code=400, detail="draw_type must be SEEDED or RANDOM")
+    venue_id = resolve_venue_id(req.venue_id, db) if req.venue_id else None
+    t = Tournament(name=req.name, venue_id=venue_id, location_name=req.location_name, city=req.city, province=req.province,
+        scheduled_at=req.scheduled_at, registration_closes_at=req.registration_closes_at, check_in_closes_at=req.check_in_closes_at,
+        max_players=req.max_players, entry_fee_cents=req.entry_fee_cents, platform_fee_cents=req.platform_fee_cents,
+        prize_info=req.prize_info, race_to=req.race_to, draw_type=draw_type, ranked=req.ranked, rules=req.rules,
+        available_tables=req.available_tables, created_by=player.id)
+    db.add(t); db.commit(); db.refresh(t)
+    return tournament_to_dict(t, db, True)
+
+@app.get("/tournaments/{tournament_id}")
+def get_tournament(tournament_id: str, db: Session = Depends(get_db)):
+    t = db.query(Tournament).filter(Tournament.id == uuid.UUID(tournament_id)).first()
+    if not t: raise HTTPException(status_code=404, detail="Tournament not found")
+    data = tournament_to_dict(t, db, True)
+    bracket=[]
+    for m in db.query(TournamentBracketMatch).filter(TournamentBracketMatch.tournament_id == t.id).order_by(TournamentBracketMatch.round_number, TournamentBracketMatch.match_number).all():
+        def pname(pid):
+            if not pid: return None
+            pp=db.query(PlayerProfile).filter(PlayerProfile.id==pid).first()
+            return f"{pp.first_name} {pp.last_name}" if pp else "Player"
+        bracket.append({"id":str(m.id),"round_number":m.round_number,"match_number":m.match_number,"player1_id":str(m.player1_id) if m.player1_id else None,"player2_id":str(m.player2_id) if m.player2_id else None,"player1":pname(m.player1_id),"player2":pname(m.player2_id),"player1_score":m.player1_score,"player2_score":m.player2_score,"winner_id":str(m.winner_id) if m.winner_id else None,"table_number":m.table_number,"status":m.status})
+    data["bracket"] = bracket
+    return data
+
+@app.post("/tournaments/{tournament_id}/enter")
+def enter_tournament(tournament_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    t=db.query(Tournament).filter(Tournament.id==uuid.UUID(tournament_id)).first()
+    if not t: raise HTTPException(status_code=404, detail="Tournament not found")
+    if t.status not in ("REGISTRATION_OPEN","FULL"): raise HTTPException(status_code=400, detail="Registration is closed")
+    existing=db.query(TournamentEntry).filter(TournamentEntry.tournament_id==t.id,TournamentEntry.player_id==player.id).first()
+    if existing: return {"status":existing.status,"tournament":tournament_to_dict(t,db)}
+    active_count=db.query(TournamentEntry).filter(TournamentEntry.tournament_id==t.id,TournamentEntry.status.in_(["REGISTERED","CHECKED_IN"])).count()
+    if active_count >= t.max_players:
+        wait_count=db.query(TournamentEntry).filter(TournamentEntry.tournament_id==t.id,TournamentEntry.status=="WAITLISTED").count()
+        entry=TournamentEntry(tournament_id=t.id,player_id=player.id,status="WAITLISTED",waitlist_position=wait_count+1)
+        t.status="FULL"
+    else:
+        entry=TournamentEntry(tournament_id=t.id,player_id=player.id,status="REGISTERED")
+        if active_count + 1 >= t.max_players: t.status="FULL"
+    db.add(entry); db.commit()
+    return {"status":entry.status,"waitlist_position":entry.waitlist_position,"tournament":tournament_to_dict(t,db)}
+
+@app.post("/tournaments/{tournament_id}/check-in")
+def tournament_check_in(tournament_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    entry=db.query(TournamentEntry).filter(TournamentEntry.tournament_id==uuid.UUID(tournament_id),TournamentEntry.player_id==player.id).first()
+    if not entry or entry.status not in ("REGISTERED","CHECKED_IN"): raise HTTPException(status_code=400, detail="You are not registered for this tournament")
+    entry.status="CHECKED_IN"; entry.checked_in_at=datetime.utcnow(); db.commit()
+    return {"success":True,"status":"CHECKED_IN"}
+
+@app.post("/tournaments/{tournament_id}/draw")
+def generate_tournament_draw(tournament_id: str, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    import random, math
+    t=db.query(Tournament).filter(Tournament.id==uuid.UUID(tournament_id)).first()
+    if not t: raise HTTPException(status_code=404, detail="Tournament not found")
+    if str(t.created_by) != str(player.id):
+        user=db.query(User).filter(User.id==player.user_id).first()
+        if not user or not user.is_admin: raise HTTPException(status_code=403, detail="Only the organiser can generate the draw")
+    entries=db.query(TournamentEntry).filter(TournamentEntry.tournament_id==t.id,TournamentEntry.status.in_(["REGISTERED","CHECKED_IN"])).all()
+    if len(entries)<2: raise HTTPException(status_code=400, detail="At least 2 players are required")
+    db.query(TournamentBracketMatch).filter(TournamentBracketMatch.tournament_id==t.id).delete(synchronize_session=False)
+    if t.draw_type == "SEEDED":
+        entries.sort(key=lambda e: (db.query(RatingProfile).filter(RatingProfile.player_id==e.player_id).first().public_rating if db.query(RatingProfile).filter(RatingProfile.player_id==e.player_id).first() else 800), reverse=True)
+    else: random.shuffle(entries)
+    for idx,e in enumerate(entries,1): e.seed=idx
+    size=1
+    while size<len(entries): size*=2
+    slots=[e.player_id for e in entries]+[None]*(size-len(entries))
+    # simple seeded separation: odds from top, evens mirrored
+    if t.draw_type=="SEEDED" and size>2:
+        arranged=[None]*size
+        for i,pid in enumerate(slots):
+            pos = i//2 if i%2==0 else size-1-(i//2)
+            arranged[pos]=pid
+        slots=arranged
+    matches=[]
+    for i in range(0,size,2):
+        p1,p2=slots[i],slots[i+1]
+        status="READY" if p1 and p2 else "BYE"
+        winner=(p1 or p2) if status=="BYE" else None
+        m=TournamentBracketMatch(tournament_id=t.id,round_number=1,match_number=(i//2)+1,player1_id=p1,player2_id=p2,winner_id=winner,status=status,table_number=((i//2)%max(1,t.available_tables))+1 if status=="READY" else None)
+        db.add(m); matches.append(m)
+    t.status="DRAW_PUBLISHED"; db.commit()
+    return get_tournament(tournament_id, db)
+
+@app.post("/tournaments/{tournament_id}/matches/{bracket_match_id}/result")
+def submit_tournament_match_result(tournament_id: str, bracket_match_id: str, req: TournamentResultRequest, player: PlayerProfile = Depends(get_current_player), db: Session = Depends(get_db)):
+    t=db.query(Tournament).filter(Tournament.id==uuid.UUID(tournament_id)).first()
+    bm=db.query(TournamentBracketMatch).filter(TournamentBracketMatch.id==uuid.UUID(bracket_match_id),TournamentBracketMatch.tournament_id==uuid.UUID(tournament_id)).first()
+    if not t or not bm: raise HTTPException(status_code=404, detail="Tournament match not found")
+    if player.id not in (bm.player1_id,bm.player2_id) and str(t.created_by)!=str(player.id): raise HTTPException(status_code=403, detail="Only a participant or organiser can submit this score")
+    if req.player1_score==req.player2_score: raise HTTPException(status_code=400, detail="Tournament match cannot end in a draw")
+    if max(req.player1_score,req.player2_score) < t.race_to: raise HTTPException(status_code=400, detail=f"Winner must reach race to {t.race_to}")
+    bm.player1_score=req.player1_score; bm.player2_score=req.player2_score; bm.winner_id=bm.player1_id if req.player1_score>req.player2_score else bm.player2_id; bm.status="COMPLETED"; bm.completed_at=datetime.utcnow()
+    # Advance the winner. If this round only had one match, it was the final.
+    round_match_count=db.query(TournamentBracketMatch).filter(TournamentBracketMatch.tournament_id==t.id,TournamentBracketMatch.round_number==bm.round_number).count()
+    if round_match_count == 1:
+        t.status="COMPLETED"
+    else:
+        next_round=bm.round_number+1; next_match=(bm.match_number+1)//2
+        nxt=db.query(TournamentBracketMatch).filter(TournamentBracketMatch.tournament_id==t.id,TournamentBracketMatch.round_number==next_round,TournamentBracketMatch.match_number==next_match).first()
+        if not nxt:
+            nxt=TournamentBracketMatch(tournament_id=t.id,round_number=next_round,match_number=next_match,status="PENDING")
+            db.add(nxt); db.flush()
+        if bm.match_number%2==1: nxt.player1_id=bm.winner_id
+        else: nxt.player2_id=bm.winner_id
+        if nxt.player1_id and nxt.player2_id:
+            nxt.status="READY"; nxt.table_number=((next_match-1)%max(1,t.available_tables))+1
+    db.commit()
+    return {"success":True,"winner_id":str(bm.winner_id),"tournament":get_tournament(tournament_id,db)}
 
 def get_unique_opponent_ids(player_id: uuid.UUID, db: Session) -> set:
     """
